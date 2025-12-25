@@ -5,12 +5,14 @@ use crate::db::VectorDB;
 use crate::embedding::EmbeddingClient;
 use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
+use std::time::Instant;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
@@ -111,28 +113,52 @@ impl Indexer {
         }
 
         println!("Embedding {} chunks...", chunks_to_embed.len());
-        
+
         // Batch embedding
         let batch_size = self.config.embedding.batch_size;
-        for batch in chunks_to_embed.chunks(batch_size) {
+        let total_batches = (chunks_to_embed.len() + batch_size - 1) / batch_size;
+        info!("Starting batch embedding: {} batches of size {}", total_batches, batch_size);
+
+        for (batch_num, batch) in chunks_to_embed.chunks(batch_size).enumerate() {
+            debug!("Processing batch {}/{} ({} chunks)", batch_num + 1, total_batches, batch.len());
+
             let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+            debug!("Extracted {} texts from batch", texts.len());
+
+            let start = Instant::now();
             match embedder.embed(texts).await {
                 Ok(embeddings) => {
-                     let mut points = Vec::new();
-                     for (chunk, embedding) in batch.iter().zip(embeddings) {
-                         let payload = json!({
-                             "file_path": chunk.file_path,
-                             "content": chunk.content,
-                             "chunk_index": chunk.chunk_index,
-                             // Add more metadata
-                         });
-                         points.push((chunk.id, embedding, payload));
-                     }
-                     db.upsert_chunks(points).await?;
+                    let duration = start.elapsed();
+                    debug!("Embedding batch {}/{} completed in {:?}", batch_num + 1, total_batches, duration);
+                    debug!("Got {} embeddings", embeddings.len());
+
+                    let mut points = Vec::new();
+                    for (chunk, embedding) in batch.iter().zip(embeddings) {
+                        let payload = json!({
+                            "file_path": chunk.file_path,
+                            "content": chunk.content,
+                            "chunk_index": chunk.chunk_index,
+                        });
+                        points.push((chunk.id, embedding, payload));
+                    }
+                    debug!("Prepared {} points for upsert", points.len());
+
+                    match db.upsert_chunks(points).await {
+                        Ok(_) => debug!("Batch {}/{} upserted successfully", batch_num + 1, total_batches),
+                        Err(e) => {
+                            error!("Failed to upsert batch {}/{}: {:?}", batch_num + 1, total_batches, e);
+                            return Err(e.context(format!("Batch {} upsert failed", batch_num + 1)));
+                        }
+                    }
                 },
-                Err(e) => eprintln!("Failed to embed batch: {}", e),
+                Err(e) => {
+                    error!("Failed to embed batch {}/{}: {:?}", batch_num + 1, total_batches, e);
+                    eprintln!("Failed to embed batch {}: {}", batch_num + 1, e);
+                    return Err(e);
+                },
             }
         }
+        info!("All {} batches processed successfully", total_batches);
 
         manifest.files = new_manifest_entries;
         let file = fs::File::create(&manifest_path)?;

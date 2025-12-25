@@ -21,6 +21,8 @@ enum Commands {
     /// Create/update index in <path>
     Index {
         path: PathBuf,
+        #[arg(long)]
+        debug: bool,
     },
     /// Search (implicit query if not a subcommand)
     Query {
@@ -45,7 +47,12 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match &cli.command {
-        Commands::Index { path } => {
+        Commands::Index { path, debug } => {
+            if *debug {
+                env_logger::Builder::from_default_env()
+                    .filter_level(log::LevelFilter::Debug)
+                    .init();
+            }
             let config = config::Config::load_global_config().unwrap_or_default();
             // Resolve absolute path
             let root_path = std::fs::canonicalize(path).unwrap_or(path.clone());

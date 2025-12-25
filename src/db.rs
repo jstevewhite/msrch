@@ -5,6 +5,7 @@ use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::{connect, Table};
+use log::debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 use uuid::Uuid;
@@ -62,25 +63,31 @@ impl VectorDB {
 
     pub async fn upsert_chunks(&self, chunks: Vec<(Uuid, Vec<f32>, serde_json::Value)>) -> Result<()> {
         if chunks.is_empty() {
+            debug!("upsert_chunks: no chunks to upsert");
             return Ok(());
         }
 
+        debug!("upsert_chunks: starting with {} chunks", chunks.len());
+
         let len = chunks.len();
         let mut ids = Vec::with_capacity(len);
-        let mut vectors = Vec::with_capacity(len * 1024); 
+        let mut vectors = Vec::with_capacity(len * 1024);
         let mut file_paths = Vec::with_capacity(len);
         let mut chunk_indices = Vec::with_capacity(len);
         let mut contents = Vec::with_capacity(len);
 
         let dim = chunks[0].1.len();
+        debug!("upsert_chunks: embedding dimension: {}", dim);
 
-        for (id, vector, payload) in chunks {
+        for (id, vector, payload) in &chunks {
             ids.push(id.to_string());
             vectors.extend(vector);
-            
+
             let obj = payload.as_object().unwrap();
-            file_paths.push(obj.get("file_path").and_then(|v| v.as_str()).unwrap_or("").to_string());
-            chunk_indices.push(obj.get("chunk_index").and_then(|v| v.as_u64()).unwrap_or(0));
+            let file_path = obj.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            file_paths.push(file_path.to_string());
+            let chunk_index = obj.get("chunk_index").and_then(|v| v.as_u64()).unwrap_or(0);
+            chunk_indices.push(chunk_index);
             contents.push(obj.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string());
         }
 
@@ -99,6 +106,7 @@ impl VectorDB {
             Field::new("content", DataType::Utf8, false),
         ]));
 
+        debug!("upsert_chunks: building RecordBatch");
         let batch = RecordBatch::try_new(
             schema.clone(),
             vec![
@@ -112,12 +120,16 @@ impl VectorDB {
                 Arc::new(StringArray::from(contents)),
             ],
         )?;
+        debug!("upsert_chunks: RecordBatch created with {} rows", batch.num_rows());
 
+        debug!("upsert_chunks: opening table '{}'", self.table_name);
         let table = self.connection.open_table(&self.table_name).execute().await?;
-        
+
         // Wrap in RecordBatchIterator to satisfy IntoArrow
         let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        debug!("upsert_chunks: calling table.add()");
         table.add(reader).execute().await?;
+        debug!("upsert_chunks: table.add() completed successfully");
 
         Ok(())
     }
