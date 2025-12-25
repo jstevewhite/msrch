@@ -1,0 +1,48 @@
+# Rust
+/target/
+Cargo.lock
+
+# Backup files
+*~
+*.swp
+*.swo
+*.bak
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor
+*.sublime-*
+*.sublime-project
+
+# msrch project-specific
+.msrch/
+
+# Environment
+.env
+.env.local
+*.env
+
+# Logs
+*.log
+
+# Testing
+.tarpaulin/
+
+# Database
+*.db
+*.db-shm
+*.db-wal
