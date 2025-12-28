@@ -114,6 +114,9 @@ msrch "config parsing" --threshold 0.7
 # JSON output for scripting
 msrch "database" --format json | jq '.results[].file_path'
 
+# Use reranker for better precision (slower)
+msrch "auth logic" --rerank
+
 # Specify index explicitly
 msrch "query" --index /path/to/.msrch
 ```
@@ -164,6 +167,12 @@ ignore_patterns = [
 default_limit = 10
 min_similarity = 0.5
 output_format = "context"  # plain|context|json
+
+[reranker]
+enabled = false
+endpoint = "http://localhost:7995/rerank"
+model = "BAAI/bge-reranker-large"
+top_n = 50
 
 [display]
 show_similarity_scores = true

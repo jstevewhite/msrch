@@ -8,6 +8,7 @@ pub struct Config {
     pub indexing: IndexingConfig,
     pub query: QueryConfig,
     pub display: DisplayConfig,
+    pub reranker: RerankerConfig,
 }
 
 impl Default for Config {
@@ -18,6 +19,7 @@ impl Default for Config {
             indexing: IndexingConfig::default(),
             query: QueryConfig::default(),
             display: DisplayConfig::default(),
+            reranker: RerankerConfig::default(),
         }
     }
 }
@@ -117,6 +119,25 @@ impl Default for DisplayConfig {
         Self {
             show_similarity_scores: true,
             color_output: true,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct RerankerConfig {
+    pub enabled: bool,
+    pub endpoint: String,
+    pub model: String,
+    pub top_n: usize,  // How many candidates to fetch for reranking
+}
+
+impl Default for RerankerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            endpoint: "http://localhost:7995/rerank".to_string(),
+            model: "BAAI/bge-reranker-large".to_string(),
+            top_n: 50,  // Fetch 50, rerank to top 10
         }
     }
 }

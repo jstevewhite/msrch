@@ -4,7 +4,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
 use lancedb::query::{ExecutableQuery, QueryBase};
-use lancedb::{connect, Table};
+use lancedb::{connect, DistanceType};
 use log::debug;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -134,11 +134,46 @@ impl VectorDB {
         Ok(())
     }
 
+    pub async fn count(&self) -> Result<usize> {
+        let table_names = self.connection.table_names().execute().await?;
+        if !table_names.contains(&self.table_name) {
+            return Ok(0);
+        }
+
+        let table = self.connection.open_table(&self.table_name).execute().await?;
+        let count = table.count_rows(None).await?;
+        Ok(count)
+    }
+
+    pub async fn delete_by_ids(&self, ids: &[Uuid]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        let table_names = self.connection.table_names().execute().await?;
+        if !table_names.contains(&self.table_name) {
+            return Ok(());
+        }
+
+        let table = self.connection.open_table(&self.table_name).execute().await?;
+
+        // Build a filter expression for all IDs: id IN ('id1', 'id2', ...)
+        let id_strings: Vec<String> = ids.iter().map(|id| format!("'{}'", id)).collect();
+        let filter = format!("id IN ({})", id_strings.join(", "));
+
+        debug!("delete_by_ids: deleting {} chunks with filter: {}", ids.len(), filter);
+        table.delete(&filter).await?;
+        debug!("delete_by_ids: deletion completed");
+
+        Ok(())
+    }
+
     pub async fn search(&self, vector: Vec<f32>, limit: u64, _min_score: f32) -> Result<Vec<ScoredPoint>> {
         let table = self.connection.open_table(&self.table_name).execute().await?;
         
         let results = table
             .vector_search(vector)?
+            .distance_type(DistanceType::Cosine)
             .limit(limit as usize)
             .execute()
             .await?;

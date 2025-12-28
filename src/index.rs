@@ -1,4 +1,4 @@
-use crate::chunker::{Chunker, Chunk};
+use crate::chunker::Chunker;
 use crate::config::Config;
 use crate::crawler::Crawler;
 use crate::db::VectorDB;
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::SystemTime;
 use std::time::Instant;
 
@@ -45,8 +45,7 @@ impl Indexer {
         println!("Using embedding endpoint: {}", self.config.embedding.endpoint);
         let db = VectorDB::new(msrch_dir.join("index.db")).await?;
 
-        // Initialize Collection (assume default dim for now, or fetch from first embed)
-        db.init_collection(1024).await?; // mxbai-large is 1024 dims
+        // Collection will be initialized on first embedding (to detect dimension)
 
         let manifest_path = msrch_dir.join("manifest.json");
         let mut manifest: Manifest = if manifest_path.exists() {
@@ -82,7 +81,14 @@ impl Indexer {
                      pb.inc(1);
                     continue;
                 }
-                // TODO: Delete old chunks from DB if reindexing (requires delete support in DB wrapper)
+                // Delete old chunks from DB before reindexing
+                if !existing_meta.chunk_ids.is_empty() {
+                    debug!("Deleting {} stale chunks for modified file: {:?}",
+                           existing_meta.chunk_ids.len(), file_path);
+                    if let Err(e) = db.delete_by_ids(&existing_meta.chunk_ids).await {
+                        warn!("Failed to delete stale chunks for {:?}: {}", file_path, e);
+                    }
+                }
             }
 
             let content = match fs::read_to_string(&file_path) {
@@ -106,9 +112,33 @@ impl Indexer {
         }
         pb.finish_with_message("Done processing files.");
 
+        // Handle deleted files: remove chunks for files that no longer exist
+        let deleted_files: Vec<_> = manifest.files.keys()
+            .filter(|path| !new_manifest_entries.contains_key(*path))
+            .cloned()
+            .collect();
+
+        if !deleted_files.is_empty() {
+            println!("Cleaning up {} deleted files...", deleted_files.len());
+            for deleted_path in &deleted_files {
+                if let Some(meta) = manifest.files.get(deleted_path) {
+                    if !meta.chunk_ids.is_empty() {
+                        debug!("Deleting {} chunks for removed file: {:?}",
+                               meta.chunk_ids.len(), deleted_path);
+                        if let Err(e) = db.delete_by_ids(&meta.chunk_ids).await {
+                            warn!("Failed to delete chunks for deleted file {:?}: {}", deleted_path, e);
+                        }
+                    }
+                }
+            }
+        }
+
         if chunks_to_embed.is_empty() {
+            // Still save manifest to reflect deleted files
+            manifest.files = new_manifest_entries;
+            let file = fs::File::create(&manifest_path)?;
+            serde_json::to_writer_pretty(file, &manifest)?;
             println!("No new files to index.");
-            // Update manifest just in case deletions happened (not handled fully here yet)
             return Ok(());
         }
 
@@ -118,6 +148,8 @@ impl Indexer {
         let batch_size = self.config.embedding.batch_size;
         let total_batches = (chunks_to_embed.len() + batch_size - 1) / batch_size;
         info!("Starting batch embedding: {} batches of size {}", total_batches, batch_size);
+
+        let mut collection_initialized = false;
 
         for (batch_num, batch) in chunks_to_embed.chunks(batch_size).enumerate() {
             debug!("Processing batch {}/{} ({} chunks)", batch_num + 1, total_batches, batch.len());
@@ -131,6 +163,16 @@ impl Indexer {
                     let duration = start.elapsed();
                     debug!("Embedding batch {}/{} completed in {:?}", batch_num + 1, total_batches, duration);
                     debug!("Got {} embeddings", embeddings.len());
+
+                    // Initialize collection on first batch using actual embedding dimension
+                    if !collection_initialized {
+                        if let Some(first_emb) = embeddings.first() {
+                            let dim = first_emb.len();
+                            info!("Detected embedding dimension: {}", dim);
+                            db.init_collection(dim).await?;
+                            collection_initialized = true;
+                        }
+                    }
 
                     let mut points = Vec::new();
                     for (chunk, embedding) in batch.iter().zip(embeddings) {
