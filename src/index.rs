@@ -4,13 +4,14 @@ use crate::crawler::Crawler;
 use crate::db::VectorDB;
 use crate::embedding::EmbeddingClient;
 use anyhow::{Context, Result};
+use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 use std::time::Instant;
 
@@ -23,6 +24,129 @@ struct Manifest {
 struct FileMetadata {
     modified_at: SystemTime,
     chunk_ids: Vec<uuid::Uuid>,
+}
+
+pub struct IndexStats {
+    pub index_path: PathBuf,
+    pub root_path: PathBuf,
+    pub file_count: usize,
+    pub chunk_count: usize,
+    pub estimated_tokens: usize,
+    pub last_indexed: Option<SystemTime>,
+    pub size_on_disk: u64,
+    pub model: String,
+    pub endpoint: String,
+}
+
+impl IndexStats {
+    pub fn print(&self) {
+        println!("{}", "Index Statistics".bold().underline());
+        println!();
+        println!("  {:<18} {}", "Index:".cyan(), self.index_path.display());
+        println!("  {:<18} {}", "Root:".cyan(), self.root_path.display());
+        println!("  {:<18} {}", "Files:".cyan(), self.file_count);
+        println!("  {:<18} {}", "Chunks:".cyan(), self.chunk_count);
+        println!("  {:<18} ~{}", "Est. tokens:".cyan(), self.estimated_tokens);
+        println!("  {:<18} {}", "Model:".cyan(), self.model);
+        println!("  {:<18} {}", "Endpoint:".cyan(), self.endpoint);
+
+        if let Some(last) = self.last_indexed {
+            if let Ok(duration) = last.duration_since(SystemTime::UNIX_EPOCH) {
+                let datetime = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0)
+                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                println!("  {:<18} {}", "Last indexed:".cyan(), datetime);
+            }
+        }
+
+        let size_str = if self.size_on_disk >= 1024 * 1024 {
+            format!("{:.1} MB", self.size_on_disk as f64 / (1024.0 * 1024.0))
+        } else if self.size_on_disk >= 1024 {
+            format!("{:.1} KB", self.size_on_disk as f64 / 1024.0)
+        } else {
+            format!("{} bytes", self.size_on_disk)
+        };
+        println!("  {:<18} {}", "Size on disk:".cyan(), size_str);
+    }
+}
+
+pub fn find_index_root(start_path: &Path) -> Option<PathBuf> {
+    let mut current = start_path.to_path_buf();
+    loop {
+        let candidate = current.join(".msrch");
+        if candidate.exists() && candidate.is_dir() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+pub async fn get_stats(start_path: &Path) -> Result<IndexStats> {
+    let index_root = find_index_root(start_path)
+        .ok_or_else(|| anyhow::anyhow!("No .msrch index found in directory tree"))?;
+
+    let msrch_dir = index_root.join(".msrch");
+    let manifest_path = msrch_dir.join("manifest.json");
+    let db_path = msrch_dir.join("index.db");
+
+    // Load manifest
+    let manifest: Manifest = if manifest_path.exists() {
+        let file = fs::File::open(&manifest_path)?;
+        serde_json::from_reader(file).unwrap_or_default()
+    } else {
+        Manifest::default()
+    };
+
+    // Get chunk count from DB
+    let chunk_count = if db_path.exists() {
+        let db = VectorDB::new(db_path.clone()).await?;
+        db.count().await.unwrap_or(0)
+    } else {
+        0
+    };
+
+    // Get last modified time
+    let last_indexed = manifest.files.values()
+        .map(|m| m.modified_at)
+        .max();
+
+    // Calculate index size
+    fn dir_size(path: &Path) -> u64 {
+        let mut size = 0;
+        if path.is_dir() {
+            if let Ok(entries) = fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        size += dir_size(&path);
+                    } else {
+                        size += entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    }
+                }
+            }
+        } else {
+            size = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        }
+        size
+    }
+    let size_on_disk = dir_size(&msrch_dir);
+
+    // Load config for model info
+    let config = Config::load_global_config().unwrap_or_default();
+
+    Ok(IndexStats {
+        index_path: msrch_dir,
+        root_path: index_root,
+        file_count: manifest.files.len(),
+        chunk_count,
+        estimated_tokens: chunk_count * 256, // Rough estimate
+        last_indexed,
+        size_on_disk,
+        model: config.embedding.model,
+        endpoint: config.embedding.endpoint,
+    })
 }
 
 pub struct Indexer {
