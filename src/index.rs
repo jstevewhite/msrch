@@ -164,7 +164,7 @@ impl Indexer {
         fs::create_dir_all(&msrch_dir).context("Failed to create .msrch dir")?;
 
         let crawler = Crawler::new(self.config.indexing.clone()); // TODO: pass actual config
-        let chunker = Chunker::new(self.config.chunking.clone());
+        let mut chunker = Chunker::new(self.config.chunking.clone());
         let embedder = EmbeddingClient::new(self.config.embedding.clone())?;
         println!("Using embedding endpoint: {}", self.config.embedding.endpoint);
         let db = VectorDB::new(msrch_dir.join("index.db")).await?;

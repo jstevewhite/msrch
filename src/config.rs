@@ -52,6 +52,9 @@ pub struct ChunkingConfig {
     pub max_chunk_tokens: usize,
     pub overlap_tokens: usize,
     pub max_file_size_mb: u64,
+    pub use_treesitter: bool,
+    pub treesitter_languages: Vec<String>,
+    pub fallback_to_tokens: bool,
 }
 
 impl Default for ChunkingConfig {
@@ -60,6 +63,15 @@ impl Default for ChunkingConfig {
             max_chunk_tokens: 512,
             overlap_tokens: 50,
             max_file_size_mb: 10,
+            use_treesitter: true,
+            treesitter_languages: vec![
+                "rust".to_string(),
+                "python".to_string(),
+                "javascript".to_string(),
+                "typescript".to_string(),
+                "go".to_string(),
+            ],
+            fallback_to_tokens: true,
         }
     }
 }

@@ -5,6 +5,7 @@
 ## Features
 
 - **Semantic Search**: Find code by meaning, not just text matching
+- **Smart Chunking**: Tree-sitter based semantic code extraction for Rust, Python, JavaScript/TypeScript, and Go
 - **Local-First**: All indexes stored locally, no cloud dependencies
 - **Git-Like UX**: Automatic index discovery (walks up tree like `git`), honors `.gitignore`
 - **Incremental**: Smart reindexing based on file modification times
@@ -30,6 +31,34 @@ cargo install --path .
 
 - Rust 2024 edition
 - An OpenAI-compatible embedding service (local or cloud)
+
+## Semantic Chunking
+
+msrch uses tree-sitter to extract complete semantic units from code files, ensuring search results contain meaningful, self-contained code snippets:
+
+### Supported Languages
+
+- **Rust** (.rs): Functions, structs, enums, traits, impl blocks, modules (with doc comments)
+- **Python** (.py): Functions, classes, methods
+- **JavaScript/TypeScript** (.js, .jsx, .ts, .tsx): Functions, classes, methods, arrow functions
+- **Go** (.go): Functions, methods, type declarations
+
+### How It Works
+
+Instead of arbitrary token-based splits, msrch:
+
+1. **Parses code structure** using tree-sitter AST parsers
+2. **Extracts complete functions/classes** as semantic chunks
+3. **Preserves context** with hierarchical paths (e.g., `impl::Person::fn::get_name`)
+4. **Falls back gracefully** to token-based chunking for:
+   - Unsupported languages
+   - Parse errors
+   - Oversized functions (>512 tokens)
+   - Non-code files (markdown, prose)
+
+### Adding Languages
+
+See [ADDING_LANGUAGES.md](ADDING_LANGUAGES.md) for step-by-step instructions on adding support for additional languages.
 
 ## Quick Start
 
@@ -154,6 +183,9 @@ max_retries = 3
 max_chunk_tokens = 512
 overlap_tokens = 50
 max_file_size_mb = 10
+use_treesitter = true
+treesitter_languages = ["rust", "python", "javascript", "typescript", "go"]
+fallback_to_tokens = true
 
 [indexing]
 skip_binary = true
@@ -268,6 +300,7 @@ See [AGENTS.md](AGENTS.md) for detailed coding guidelines.
 
 msrch is built with Rust and uses:
 
+- **tree-sitter**: AST parsing for semantic code extraction
 - **LanceDB**: Vector storage (local mode)
 - **reqwest**: HTTP client for embedding API
 - **tokio**: Async runtime
@@ -275,7 +308,7 @@ msrch is built with Rust and uses:
 - **tiktoken-rs**: Token counting
 - **anyhow**: Error handling
 
-For detailed architecture, see [msrch_HLD.md](msrch_HLD.md).
+For detailed architecture, see [msrch_HLD.md](msrch_HLD.md) and [CLAUDE.md](CLAUDE.md).
 
 ## Performance
 
