@@ -12,11 +12,19 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 use std::time::Instant;
+use std::time::SystemTime;
+
+/// Bump this whenever the on-disk vector schema changes (e.g. adding a column).
+/// Indexes written with an older version are wiped and rebuilt on the next index run.
+const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
+    /// Schema version of the index this manifest describes. Missing in manifests
+    /// written before versioning existed, which deserialize to 0 and trigger a rebuild.
+    #[serde(default)]
+    version: u32,
     files: HashMap<PathBuf, FileMetadata>,
 }
 
@@ -159,6 +167,28 @@ impl Indexer {
         Self { root_path, config }
     }
 
+    /// Wipe the on-disk index if its schema version doesn't match the current one,
+    /// resetting the manifest so the next run does a full rebuild.
+    ///
+    /// Returns `Ok(true)` if an existing index was removed (a migration happened).
+    /// Must run before connecting to the vector DB so the fresh table is created
+    /// with the current schema.
+    fn migrate_if_needed(db_path: &Path, manifest: &mut Manifest) -> Result<bool> {
+        if manifest.version == SCHEMA_VERSION {
+            return Ok(false);
+        }
+
+        let had_existing = db_path.exists();
+        if had_existing {
+            fs::remove_dir_all(db_path)
+                .context("Failed to remove outdated index during schema migration")?;
+        }
+
+        *manifest = Manifest::default();
+        manifest.version = SCHEMA_VERSION;
+        Ok(had_existing)
+    }
+
     pub async fn index(&self) -> Result<()> {
         let msrch_dir = self.root_path.join(".msrch");
         fs::create_dir_all(&msrch_dir).context("Failed to create .msrch dir")?;
@@ -166,18 +196,31 @@ impl Indexer {
         let crawler = Crawler::new(self.config.indexing.clone()); // TODO: pass actual config
         let mut chunker = Chunker::new(self.config.chunking.clone());
         let embedder = EmbeddingClient::new(self.config.embedding.clone())?;
-        println!("Using embedding endpoint: {}", self.config.embedding.endpoint);
-        let db = VectorDB::new(msrch_dir.join("index.db")).await?;
-
-        // Collection will be initialized on first embedding (to detect dimension)
+        println!(
+            "Using embedding endpoint: {}",
+            self.config.embedding.endpoint
+        );
 
         let manifest_path = msrch_dir.join("manifest.json");
+        let db_path = msrch_dir.join("index.db");
         let mut manifest: Manifest = if manifest_path.exists() {
             let file = fs::File::open(&manifest_path)?;
             serde_json::from_reader(file).unwrap_or_default()
         } else {
             Manifest::default()
         };
+
+        // Rebuild from scratch if the on-disk schema predates the current version.
+        if Self::migrate_if_needed(&db_path, &mut manifest)? {
+            println!(
+                "Index schema is outdated; rebuilding from scratch (schema v{}).",
+                SCHEMA_VERSION
+            );
+        }
+
+        // Connect after any migration so the table is created with the current schema.
+        let db = VectorDB::new(db_path).await?;
+        // Collection will be initialized on first embedding (to detect dimension)
 
         println!("Scanning files...");
         let files = crawler.crawl(&self.root_path)?;
@@ -193,22 +236,28 @@ impl Indexer {
         let mut new_manifest_entries = HashMap::new();
 
         for file_path in files {
-            pb.set_message(format!("Processing {:?}", file_path.file_name().unwrap_or_default()));
-            
+            pb.set_message(format!(
+                "Processing {:?}",
+                file_path.file_name().unwrap_or_default()
+            ));
+
             let metadata = fs::metadata(&file_path)?;
             let modified = metadata.modified()?;
-            
+
             // Check if needs reindexing
             if let Some(existing_meta) = manifest.files.get(&file_path) {
                 if existing_meta.modified_at == modified {
                     new_manifest_entries.insert(file_path.clone(), existing_meta.clone());
-                     pb.inc(1);
+                    pb.inc(1);
                     continue;
                 }
                 // Delete old chunks from DB before reindexing
                 if !existing_meta.chunk_ids.is_empty() {
-                    debug!("Deleting {} stale chunks for modified file: {:?}",
-                           existing_meta.chunk_ids.len(), file_path);
+                    debug!(
+                        "Deleting {} stale chunks for modified file: {:?}",
+                        existing_meta.chunk_ids.len(),
+                        file_path
+                    );
                     if let Err(e) = db.delete_by_ids(&existing_meta.chunk_ids).await {
                         warn!("Failed to delete stale chunks for {:?}: {}", file_path, e);
                     }
@@ -225,11 +274,14 @@ impl Indexer {
 
             let file_chunks = chunker.chunk_file(&file_path, &content)?;
             let chunk_ids: Vec<uuid::Uuid> = file_chunks.iter().map(|c| c.id).collect();
-            
-            new_manifest_entries.insert(file_path.clone(), FileMetadata {
-                modified_at: modified,
-                chunk_ids,
-            });
+
+            new_manifest_entries.insert(
+                file_path.clone(),
+                FileMetadata {
+                    modified_at: modified,
+                    chunk_ids,
+                },
+            );
 
             chunks_to_embed.extend(file_chunks);
             pb.inc(1);
@@ -237,7 +289,9 @@ impl Indexer {
         pb.finish_with_message("Done processing files.");
 
         // Handle deleted files: remove chunks for files that no longer exist
-        let deleted_files: Vec<_> = manifest.files.keys()
+        let deleted_files: Vec<_> = manifest
+            .files
+            .keys()
             .filter(|path| !new_manifest_entries.contains_key(*path))
             .cloned()
             .collect();
@@ -247,10 +301,16 @@ impl Indexer {
             for deleted_path in &deleted_files {
                 if let Some(meta) = manifest.files.get(deleted_path) {
                     if !meta.chunk_ids.is_empty() {
-                        debug!("Deleting {} chunks for removed file: {:?}",
-                               meta.chunk_ids.len(), deleted_path);
+                        debug!(
+                            "Deleting {} chunks for removed file: {:?}",
+                            meta.chunk_ids.len(),
+                            deleted_path
+                        );
                         if let Err(e) = db.delete_by_ids(&meta.chunk_ids).await {
-                            warn!("Failed to delete chunks for deleted file {:?}: {}", deleted_path, e);
+                            warn!(
+                                "Failed to delete chunks for deleted file {:?}: {}",
+                                deleted_path, e
+                            );
                         }
                     }
                 }
@@ -271,21 +331,43 @@ impl Indexer {
         // Batch embedding
         let batch_size = self.config.embedding.batch_size;
         let total_batches = (chunks_to_embed.len() + batch_size - 1) / batch_size;
-        info!("Starting batch embedding: {} batches of size {}", total_batches, batch_size);
+        info!(
+            "Starting batch embedding: {} batches of size {}",
+            total_batches, batch_size
+        );
 
         let mut collection_initialized = false;
 
         for (batch_num, batch) in chunks_to_embed.chunks(batch_size).enumerate() {
-            debug!("Processing batch {}/{} ({} chunks)", batch_num + 1, total_batches, batch.len());
+            debug!(
+                "Processing batch {}/{} ({} chunks)",
+                batch_num + 1,
+                total_batches,
+                batch.len()
+            );
 
-            let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+            // Embed the semantic context path (e.g. "impl::Foo::fn::bar") alongside the
+            // content so symbol/scope names influence the vector. The raw content is still
+            // what gets stored and displayed.
+            let texts: Vec<String> = batch
+                .iter()
+                .map(|c| match &c.context {
+                    Some(ctx) if !ctx.is_empty() => format!("{}\n{}", ctx, c.content),
+                    _ => c.content.clone(),
+                })
+                .collect();
             debug!("Extracted {} texts from batch", texts.len());
 
             let start = Instant::now();
             match embedder.embed(texts).await {
                 Ok(embeddings) => {
                     let duration = start.elapsed();
-                    debug!("Embedding batch {}/{} completed in {:?}", batch_num + 1, total_batches, duration);
+                    debug!(
+                        "Embedding batch {}/{} completed in {:?}",
+                        batch_num + 1,
+                        total_batches,
+                        duration
+                    );
                     debug!("Got {} embeddings", embeddings.len());
 
                     // Initialize collection on first batch using actual embedding dimension
@@ -304,24 +386,39 @@ impl Indexer {
                             "file_path": chunk.file_path,
                             "content": chunk.content,
                             "chunk_index": chunk.chunk_index,
+                            "context": chunk.context.clone().unwrap_or_default(),
                         });
                         points.push((chunk.id, embedding, payload));
                     }
                     debug!("Prepared {} points for upsert", points.len());
 
                     match db.upsert_chunks(points).await {
-                        Ok(_) => debug!("Batch {}/{} upserted successfully", batch_num + 1, total_batches),
+                        Ok(_) => debug!(
+                            "Batch {}/{} upserted successfully",
+                            batch_num + 1,
+                            total_batches
+                        ),
                         Err(e) => {
-                            error!("Failed to upsert batch {}/{}: {:?}", batch_num + 1, total_batches, e);
+                            error!(
+                                "Failed to upsert batch {}/{}: {:?}",
+                                batch_num + 1,
+                                total_batches,
+                                e
+                            );
                             return Err(e.context(format!("Batch {} upsert failed", batch_num + 1)));
                         }
                     }
-                },
+                }
                 Err(e) => {
-                    error!("Failed to embed batch {}/{}: {:?}", batch_num + 1, total_batches, e);
+                    error!(
+                        "Failed to embed batch {}/{}: {:?}",
+                        batch_num + 1,
+                        total_batches,
+                        e
+                    );
                     eprintln!("Failed to embed batch {}: {}", batch_num + 1, e);
                     return Err(e);
-                },
+                }
             }
         }
         info!("All {} batches processed successfully", total_batches);
@@ -331,5 +428,109 @@ impl Indexer {
         serde_json::to_writer_pretty(file, &manifest)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir() -> PathBuf {
+        // uuid is already a dependency; use it to avoid parallel-test collisions.
+        let dir = std::env::temp_dir().join(format!("msrch_test_{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn seed_index(db_path: &Path, marker: &[u8]) {
+        fs::create_dir_all(db_path).unwrap();
+        fs::write(db_path.join("data.lance"), marker).unwrap();
+    }
+
+    #[test]
+    fn migrate_wipes_outdated_index() {
+        let dir = temp_dir();
+        let db_path = dir.join("index.db");
+        seed_index(&db_path, b"stale");
+
+        // An index written before this schema version, with tracked files.
+        let mut manifest = Manifest {
+            version: 0,
+            files: HashMap::new(),
+        };
+        manifest.files.insert(
+            PathBuf::from("foo.rs"),
+            FileMetadata {
+                modified_at: SystemTime::UNIX_EPOCH,
+                chunk_ids: vec![uuid::Uuid::new_v4()],
+            },
+        );
+
+        let migrated = Indexer::migrate_if_needed(&db_path, &mut manifest).unwrap();
+
+        assert!(migrated, "should report that a migration happened");
+        assert!(!db_path.exists(), "outdated index dir should be removed");
+        assert_eq!(manifest.version, SCHEMA_VERSION);
+        assert!(
+            manifest.files.is_empty(),
+            "manifest should be reset so every file is re-embedded"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_is_noop_when_version_current() {
+        let dir = temp_dir();
+        let db_path = dir.join("index.db");
+        seed_index(&db_path, b"current");
+
+        let mut manifest = Manifest {
+            version: SCHEMA_VERSION,
+            files: HashMap::new(),
+        };
+        manifest.files.insert(
+            PathBuf::from("bar.rs"),
+            FileMetadata {
+                modified_at: SystemTime::UNIX_EPOCH,
+                chunk_ids: vec![],
+            },
+        );
+
+        let migrated = Indexer::migrate_if_needed(&db_path, &mut manifest).unwrap();
+
+        assert!(!migrated, "no migration when the schema version matches");
+        assert!(db_path.exists(), "current index dir should be preserved");
+        assert_eq!(manifest.files.len(), 1, "manifest should be untouched");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_on_fresh_index_reports_no_wipe() {
+        // No index on disk yet (fresh project): default manifest is version 0.
+        let dir = temp_dir();
+        let db_path = dir.join("index.db");
+        let mut manifest = Manifest::default();
+
+        let migrated = Indexer::migrate_if_needed(&db_path, &mut manifest).unwrap();
+
+        assert!(!migrated, "nothing to wipe on a brand-new index");
+        assert_eq!(
+            manifest.version, SCHEMA_VERSION,
+            "version should be stamped"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn old_manifest_json_reads_as_version_zero() {
+        // Manifests written before versioning have no `version` field.
+        let manifest: Manifest = serde_json::from_str(r#"{"files":{}}"#).unwrap();
+        assert_eq!(
+            manifest.version, 0,
+            "a missing version must read as 0 so migration is triggered"
+        );
     }
 }

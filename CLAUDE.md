@@ -51,20 +51,20 @@ cargo run -- query "search query" --limit 5 --rerank
 1. **Crawler** (`crawler.rs`) - Walks directory tree, respects `.gitignore`/`.msrchignore`, filters binary files
 2. **Chunker** (`chunker.rs`) - Splits files into token-sized chunks using tiktoken, with overlap for context
 3. **EmbeddingClient** (`embedding.rs`) - Batches chunks and calls OpenAI-compatible embedding API
-4. **VectorDB** (`db.rs`) - Stores embeddings in LanceDB with HNSW indexing for fast retrieval
+4. **VectorDB** (`db.rs`) - Stores embeddings in LanceDB (currently flat/brute-force scan)
 5. **Manifest** (`index.rs`) - Tracks file modification times for incremental reindexing
 
 **Query Pipeline:**
 1. **Index Discovery** - Walks up directory tree to find `.msrch/` (like git finding `.git/`)
 2. **Query Embedding** - Embeds search text using same model as indexing
-3. **Vector Search** - LanceDB HNSW similarity search (cosine distance converted to similarity: `1.0 - distance`)
+3. **Vector Search** - LanceDB flat similarity search (cosine distance converted to similarity: `1.0 - distance`)
 4. **Optional Reranking** (`reranker.rs`) - Cross-encoder reranking for precision (slower but more accurate)
 5. **Result Formatting** - Plain/Context/JSON output modes
 
 ### Key Modules
 
 - **`main.rs`** - CLI parsing with clap, command dispatch, implicit query support (`msrch "text"`)
-- **`config.rs`** - Hierarchical config: CLI flags → project `.msrch/config.toml` → `~/.config/msrch/config.toml` → defaults
+- **`config.rs`** - Global configuration via `confy` (project-specific overrides not yet wired up)
 - **`index.rs`** - Indexing orchestration, incremental updates, manifest management
 - **`search.rs`** - Query execution, index discovery (walk-up pattern), output formatting
 - **`db.rs`** - LanceDB wrapper using Arrow RecordBatch for bulk operations
@@ -76,10 +76,11 @@ cargo run -- query "search query" --limit 5 --rerank
 ### Vector Database (LanceDB)
 
 - **Storage:** `.msrch/index.db/` directory with LanceDB files
-- **Schema:** `id` (UUID as string), `vector` (FixedSizeList\<Float32\>), `file_path`, `chunk_index`, `content`
-- **Index:** HNSW for fast approximate nearest neighbor search
-- **Operations:** Upsert chunks by ID (idempotent), search with distance threshold, delete by ID list
+- **Schema:** `id` (UUID as string), `vector` (FixedSizeList\<Float32\>), `file_path`, `chunk_index`, `content`, `context` (semantic path from tree-sitter, e.g. `impl::Foo::fn::bar`)
+- **Index:** Flat scanning (no ANN index built yet)
+- **Operations:** Append chunks (delete-by-id then add), search with `min_similarity` threshold filtering, delete by ID list
 - **Distance Metric:** Cosine distance (converted to similarity: `score = 1.0 - distance`)
+- **Schema versioning:** `manifest.json` carries a `version` (see `SCHEMA_VERSION` in `index.rs`). On `index`/`reindex`, a version mismatch (or a pre-versioning manifest) wipes `index.db` and rebuilds so the table is recreated with the current schema.
 
 ### Incremental Reindexing Strategy
 
@@ -107,9 +108,9 @@ Implementation is in `search.rs::find_index_root()`.
 
 ### Config Hierarchy (high to low precedence)
 1. CLI flags: `--limit`, `--rerank`, etc.
-2. Project config: `.msrch/config.toml` (in indexed directory)
-3. User config: `~/.config/msrch/config.toml` (or OS-specific config dir)
-4. Hardcoded defaults in `config.rs::Default` implementations
+2. Global User config: `~/.config/msrch/config.toml` (via `confy`)
+3. Hardcoded defaults in `config.rs::Default` implementations
+*(Note: Project-specific `.msrch/config.toml` is defined but not yet wired up)*
 
 ### Default Embedding Endpoint
 - Default: `http://r7.home.lab:7997/embeddings`
@@ -118,8 +119,8 @@ Implementation is in `search.rs::find_index_root()`.
 
 ### Config Loading
 - Global: `Config::load_global_config()` uses `confy` crate (OS-specific config dir)
-- Project: `Config::load_from_path()` loads from TOML file
-- No automatic merging yet - each command loads appropriate config
+- Project: `Config::load_from_path()` is defined but currently unused
+- Note: retries, `max_file_size_mb`, and project configs are pending implementation
 
 ## Important Implementation Details
 

@@ -1,10 +1,16 @@
 use crate::config::ChunkingConfig;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use log::{debug, warn};
 use std::path::PathBuf;
+use std::sync::LazyLock;
 use tiktoken_rs::cl100k_base;
-use tree_sitter::{Parser, Node};
+use tree_sitter::{Node, Parser};
 use uuid::Uuid;
+
+/// Shared tokenizer, built once. `cl100k_base` loads from data embedded in the
+/// crate, so this is effectively infallible at runtime.
+static BPE: LazyLock<tiktoken_rs::CoreBPE> =
+    LazyLock::new(|| cl100k_base().expect("failed to initialize cl100k_base tokenizer"));
 
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -67,7 +73,10 @@ impl Chunker {
             match lang.as_str() {
                 "rust" => {
                     let mut parser = Parser::new();
-                    if parser.set_language(&tree_sitter_rust::LANGUAGE.into()).is_ok() {
+                    if parser
+                        .set_language(&tree_sitter_rust::LANGUAGE.into())
+                        .is_ok()
+                    {
                         self.rust_parser = Some(parser);
                         debug!("Initialized Rust tree-sitter parser");
                     }
@@ -129,10 +138,10 @@ impl Chunker {
         match extension.as_str() {
             // Code files
             "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "go" | "c" | "cpp" | "h" | "hpp"
-            | "java" | "rb" | "sh" | "bash" | "zsh" | "swift" | "kt" | "scala" | "php"
-            | "cs" | "lua" | "r" | "pl" | "pm" | "ex" | "exs" | "erl" | "hs" | "ml"
-            | "vue" | "svelte" | "zig" | "nim" | "v" | "d" | "f90" | "jl" | "clj" | "lisp"
-            | "el" | "vim" | "sql" | "graphql" | "proto" | "thrift" => FileType::Code,
+            | "java" | "rb" | "sh" | "bash" | "zsh" | "swift" | "kt" | "scala" | "php" | "cs"
+            | "lua" | "r" | "pl" | "pm" | "ex" | "exs" | "erl" | "hs" | "ml" | "vue" | "svelte"
+            | "zig" | "nim" | "v" | "d" | "f90" | "jl" | "clj" | "lisp" | "el" | "vim" | "sql"
+            | "graphql" | "proto" | "thrift" => FileType::Code,
 
             // Markdown
             "md" | "mdx" | "markdown" => FileType::Markdown,
@@ -203,7 +212,7 @@ impl Chunker {
         }
 
         let mut chunks = Vec::new();
-        let bpe = cl100k_base().context("Failed to get tokenizer")?;
+        let bpe = &*BPE;
 
         match language {
             CodeLanguage::Rust => {
@@ -263,8 +272,14 @@ impl Chunker {
             // Nodes we want to extract as chunks
             let is_extractable = matches!(
                 kind,
-                "function_item" | "struct_item" | "enum_item" | "trait_item"
-                | "impl_item" | "mod_item" | "const_item" | "static_item"
+                "function_item"
+                    | "struct_item"
+                    | "enum_item"
+                    | "trait_item"
+                    | "impl_item"
+                    | "mod_item"
+                    | "const_item"
+                    | "static_item"
             );
 
             if is_extractable {
@@ -286,7 +301,12 @@ impl Chunker {
                         let new_context = if context_path.is_empty() {
                             format!("{}::{}", kind.replace("_item", ""), item_name)
                         } else {
-                            format!("{}::{}::{}", context_path, kind.replace("_item", ""), item_name)
+                            format!(
+                                "{}::{}::{}",
+                                context_path,
+                                kind.replace("_item", ""),
+                                item_name
+                            )
                         };
 
                         chunks.push(Chunk {
@@ -303,7 +323,16 @@ impl Chunker {
                         if kind == "impl_item" || kind == "mod_item" {
                             let mut child_cursor = node.walk();
                             for child in node.children(&mut child_cursor) {
-                                visit_rust_node(child, content, file_path, bpe, max_tokens, chunks, chunk_idx, &new_context);
+                                visit_rust_node(
+                                    child,
+                                    content,
+                                    file_path,
+                                    bpe,
+                                    max_tokens,
+                                    chunks,
+                                    chunk_idx,
+                                    &new_context,
+                                );
                             }
                         }
                         return; // Don't visit children again
@@ -314,11 +343,29 @@ impl Chunker {
             // Visit children
             let mut child_cursor = node.walk();
             for child in node.children(&mut child_cursor) {
-                visit_rust_node(child, content, file_path, bpe, max_tokens, chunks, chunk_idx, context_path);
+                visit_rust_node(
+                    child,
+                    content,
+                    file_path,
+                    bpe,
+                    max_tokens,
+                    chunks,
+                    chunk_idx,
+                    context_path,
+                );
             }
         }
 
-        visit_rust_node(root_node, content, file_path, bpe, self.config.max_chunk_tokens, chunks, &mut chunk_idx, "");
+        visit_rust_node(
+            root_node,
+            content,
+            file_path,
+            bpe,
+            self.config.max_chunk_tokens,
+            chunks,
+            &mut chunk_idx,
+            "",
+        );
         Ok(())
     }
 
@@ -354,9 +401,26 @@ impl Chunker {
                     if token_count <= max_tokens {
                         let item_name = extract_python_item_name(node, content);
                         let new_context = if context_path.is_empty() {
-                            format!("{}::{}", if kind == "function_definition" { "fn" } else { "class" }, item_name)
+                            format!(
+                                "{}::{}",
+                                if kind == "function_definition" {
+                                    "fn"
+                                } else {
+                                    "class"
+                                },
+                                item_name
+                            )
                         } else {
-                            format!("{}::{}::{}", context_path, if kind == "function_definition" { "fn" } else { "class" }, item_name)
+                            format!(
+                                "{}::{}::{}",
+                                context_path,
+                                if kind == "function_definition" {
+                                    "fn"
+                                } else {
+                                    "class"
+                                },
+                                item_name
+                            )
                         };
 
                         chunks.push(Chunk {
@@ -373,7 +437,16 @@ impl Chunker {
                         if kind == "class_definition" {
                             let mut child_cursor = node.walk();
                             for child in node.children(&mut child_cursor) {
-                                visit_python_node(child, content, file_path, bpe, max_tokens, chunks, chunk_idx, &new_context);
+                                visit_python_node(
+                                    child,
+                                    content,
+                                    file_path,
+                                    bpe,
+                                    max_tokens,
+                                    chunks,
+                                    chunk_idx,
+                                    &new_context,
+                                );
                             }
                         }
                         return;
@@ -384,11 +457,29 @@ impl Chunker {
             // Visit children
             let mut child_cursor = node.walk();
             for child in node.children(&mut child_cursor) {
-                visit_python_node(child, content, file_path, bpe, max_tokens, chunks, chunk_idx, context_path);
+                visit_python_node(
+                    child,
+                    content,
+                    file_path,
+                    bpe,
+                    max_tokens,
+                    chunks,
+                    chunk_idx,
+                    context_path,
+                );
             }
         }
 
-        visit_python_node(root_node, content, file_path, bpe, self.config.max_chunk_tokens, chunks, &mut chunk_idx, "");
+        visit_python_node(
+            root_node,
+            content,
+            file_path,
+            bpe,
+            self.config.max_chunk_tokens,
+            chunks,
+            &mut chunk_idx,
+            "",
+        );
         Ok(())
     }
 
@@ -417,8 +508,11 @@ impl Chunker {
 
             let is_extractable = matches!(
                 kind,
-                "function_declaration" | "method_definition" | "class_declaration"
-                | "arrow_function" | "function_expression"
+                "function_declaration"
+                    | "method_definition"
+                    | "class_declaration"
+                    | "arrow_function"
+                    | "function_expression"
             );
 
             if is_extractable {
@@ -452,7 +546,16 @@ impl Chunker {
                         if kind == "class_declaration" {
                             let mut child_cursor = node.walk();
                             for child in node.children(&mut child_cursor) {
-                                visit_js_node(child, content, file_path, bpe, max_tokens, chunks, chunk_idx, &new_context);
+                                visit_js_node(
+                                    child,
+                                    content,
+                                    file_path,
+                                    bpe,
+                                    max_tokens,
+                                    chunks,
+                                    chunk_idx,
+                                    &new_context,
+                                );
                             }
                         }
                         return;
@@ -463,11 +566,29 @@ impl Chunker {
             // Visit children
             let mut child_cursor = node.walk();
             for child in node.children(&mut child_cursor) {
-                visit_js_node(child, content, file_path, bpe, max_tokens, chunks, chunk_idx, context_path);
+                visit_js_node(
+                    child,
+                    content,
+                    file_path,
+                    bpe,
+                    max_tokens,
+                    chunks,
+                    chunk_idx,
+                    context_path,
+                );
             }
         }
 
-        visit_js_node(root_node, content, file_path, bpe, self.config.max_chunk_tokens, chunks, &mut chunk_idx, "");
+        visit_js_node(
+            root_node,
+            content,
+            file_path,
+            bpe,
+            self.config.max_chunk_tokens,
+            chunks,
+            &mut chunk_idx,
+            "",
+        );
         Ok(())
     }
 
@@ -530,7 +651,16 @@ impl Chunker {
                         if kind == "type_declaration" {
                             let mut child_cursor = node.walk();
                             for child in node.children(&mut child_cursor) {
-                                visit_go_node(child, content, file_path, bpe, max_tokens, chunks, chunk_idx, &new_context);
+                                visit_go_node(
+                                    child,
+                                    content,
+                                    file_path,
+                                    bpe,
+                                    max_tokens,
+                                    chunks,
+                                    chunk_idx,
+                                    &new_context,
+                                );
                             }
                         }
                         return;
@@ -541,11 +671,29 @@ impl Chunker {
             // Visit children
             let mut child_cursor = node.walk();
             for child in node.children(&mut child_cursor) {
-                visit_go_node(child, content, file_path, bpe, max_tokens, chunks, chunk_idx, context_path);
+                visit_go_node(
+                    child,
+                    content,
+                    file_path,
+                    bpe,
+                    max_tokens,
+                    chunks,
+                    chunk_idx,
+                    context_path,
+                );
             }
         }
 
-        visit_go_node(root_node, content, file_path, bpe, self.config.max_chunk_tokens, chunks, &mut chunk_idx, "");
+        visit_go_node(
+            root_node,
+            content,
+            file_path,
+            bpe,
+            self.config.max_chunk_tokens,
+            chunks,
+            &mut chunk_idx,
+            "",
+        );
         Ok(())
     }
 
@@ -654,10 +802,12 @@ impl Chunker {
                 Err(_) => {
                     // Fallback: use lossy string conversion from raw bytes
                     String::from_utf8_lossy(
-                        &chunk_tokens.iter()
+                        &chunk_tokens
+                            .iter()
                             .flat_map(|&t| bpe.decode(vec![t]).unwrap_or_default().into_bytes())
-                            .collect::<Vec<u8>>()
-                    ).to_string()
+                            .collect::<Vec<u8>>(),
+                    )
+                    .to_string()
                 }
             };
             result.push(chunk_text);
@@ -766,7 +916,7 @@ impl Chunker {
     }
 
     pub fn chunk_file(&mut self, file_path: &PathBuf, content: &str) -> Result<Vec<Chunk>> {
-        let bpe = cl100k_base().context("Failed to get tokenizer")?;
+        let bpe = &*BPE;
 
         if content.trim().is_empty() {
             return Ok(vec![]);
@@ -778,7 +928,9 @@ impl Chunker {
             if file_type == FileType::Code {
                 let language = Self::detect_code_language(file_path);
                 if language != CodeLanguage::Unsupported {
-                    if let Ok(Some(chunks)) = self.chunk_with_treesitter(file_path, content, language) {
+                    if let Ok(Some(chunks)) =
+                        self.chunk_with_treesitter(file_path, content, language)
+                    {
                         debug!("Using tree-sitter chunks for {:?}", file_path);
                         return Ok(chunks);
                     }
@@ -843,7 +995,10 @@ fn extract_go_item_name(node: Node, content: &str) -> String {
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         // For functions and methods, look for identifier or field_identifier
-        if child.kind() == "identifier" || child.kind() == "field_identifier" || child.kind() == "type_identifier" {
+        if child.kind() == "identifier"
+            || child.kind() == "field_identifier"
+            || child.kind() == "type_identifier"
+        {
             if let Ok(name) = child.utf8_text(content.as_bytes()) {
                 return name.to_string();
             }
@@ -906,12 +1061,30 @@ mod tests {
 
     #[test]
     fn test_file_type_detection() {
-        assert_eq!(Chunker::determine_file_type(&PathBuf::from("foo.rs")), FileType::Code);
-        assert_eq!(Chunker::determine_file_type(&PathBuf::from("bar.py")), FileType::Code);
-        assert_eq!(Chunker::determine_file_type(&PathBuf::from("README.md")), FileType::Markdown);
-        assert_eq!(Chunker::determine_file_type(&PathBuf::from("notes.txt")), FileType::Prose);
-        assert_eq!(Chunker::determine_file_type(&PathBuf::from("data.json")), FileType::Unknown);
-        assert_eq!(Chunker::determine_file_type(&PathBuf::from("no_extension")), FileType::Unknown);
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("foo.rs")),
+            FileType::Code
+        );
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("bar.py")),
+            FileType::Code
+        );
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("README.md")),
+            FileType::Markdown
+        );
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("notes.txt")),
+            FileType::Prose
+        );
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("data.json")),
+            FileType::Unknown
+        );
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("no_extension")),
+            FileType::Unknown
+        );
     }
 
     #[test]

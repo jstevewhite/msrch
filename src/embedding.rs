@@ -46,7 +46,10 @@ impl EmbeddingClient {
 
     pub async fn embed(&self, texts: Vec<String>) -> Result<Vec<Vec<f32>>> {
         let url = self.config.endpoint.clone();
-        debug!("embed: sending request to '{}' with model '{}'", url, self.config.model);
+        debug!(
+            "embed: sending request to '{}' with model '{}'",
+            url, self.config.model
+        );
         debug!("embed: number of texts to embed: {}", texts.len());
 
         // Basic retry logic could be added here, simplified for POC
@@ -63,26 +66,43 @@ impl EmbeddingClient {
         }
 
         let start = Instant::now();
-        let response = req.send().await.context("Failed to send embedding request")?;
+        let response = req
+            .send()
+            .await
+            .context("Failed to send embedding request")?;
         let elapsed = start.elapsed();
-        debug!("embed: request sent, received status {} in {:?}", response.status(), elapsed);
+        debug!(
+            "embed: request sent, received status {} in {:?}",
+            response.status(),
+            elapsed
+        );
 
         if !response.status().is_success() {
-             let status = response.status();
-             let text = response.text().await.unwrap_or_default();
-             debug!("embed: API error response body: {}", text);
-             anyhow::bail!("Embedding API error: {} - {}", status, text);
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            debug!("embed: API error response body: {}", text);
+            anyhow::bail!("Embedding API error: {} - {}", status, text);
         }
 
-        let mut body: EmbeddingResponse = response.json().await.context("Failed to parse embedding response")?;
+        let mut body: EmbeddingResponse = response
+            .json()
+            .await
+            .context("Failed to parse embedding response")?;
         debug!("embed: got {} embeddings in response", body.data.len());
-        debug!("embed: prompt_tokens: {}, total_tokens: {}", body.usage.prompt_tokens, body.usage.total_tokens);
+        debug!(
+            "embed: prompt_tokens: {}, total_tokens: {}",
+            body.usage.prompt_tokens, body.usage.total_tokens
+        );
 
         // Ensure order is preserved
         body.data.sort_by_key(|d| d.index);
 
         let embeddings: Vec<Vec<f32>> = body.data.into_iter().map(|d| d.embedding).collect();
-        debug!("embed: returning {} embeddings, first dim: {}", embeddings.len(), embeddings.first().map(|e| e.len()).unwrap_or(0));
+        debug!(
+            "embed: returning {} embeddings, first dim: {}",
+            embeddings.len(),
+            embeddings.first().map(|e| e.len()).unwrap_or(0)
+        );
         Ok(embeddings)
     }
 }

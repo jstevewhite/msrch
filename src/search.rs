@@ -1,8 +1,8 @@
+use crate::OutputFormat;
 use crate::config::Config;
-use crate::db::{VectorDB, ScoredPoint};
+use crate::db::{ScoredPoint, VectorDB};
 use crate::embedding::EmbeddingClient;
 use crate::reranker::RerankerClient;
-use crate::OutputFormat;
 use anyhow::{Context, Result};
 use colored::*;
 use log::debug;
@@ -22,6 +22,7 @@ struct JsonResult {
     file_path: String,
     chunk_index: u64,
     similarity: f32,
+    context: String,
     content: String,
 }
 
@@ -35,7 +36,9 @@ impl Searcher {
         let index_root = if let Some(path) = explicit_index {
             path
         } else {
-            Self::find_index_root()?
+            // Shared walk-up root discovery (see `index::find_index_root`).
+            crate::index::find_index_root(&env::current_dir()?)
+                .context("No .msrch index found in directory tree")?
         };
 
         // Load config from index or global? For Search, mixing both is good.
@@ -45,21 +48,13 @@ impl Searcher {
         Ok(Self { config, index_root })
     }
 
-    fn find_index_root() -> Result<PathBuf> {
-        let mut current = env::current_dir()?;
-        loop {
-            let candidate = current.join(".msrch");
-            if candidate.exists() && candidate.is_dir() {
-                return Ok(current);
-            }
-            match current.parent() {
-                Some(parent) => current = parent.to_path_buf(),
-                None => anyhow::bail!("No .msrch index found in directory tree"),
-            }
-        }
-    }
-
-    pub async fn search(&self, query_text: &str, limit: Option<usize>, format: OutputFormat, use_rerank: bool) -> Result<()> {
+    pub async fn search(
+        &self,
+        query_text: &str,
+        limit: Option<usize>,
+        format: OutputFormat,
+        use_rerank: bool,
+    ) -> Result<()> {
         let embedder = EmbeddingClient::new(self.config.embedding.clone())?;
 
         // Create reranker config, overriding enabled flag if --rerank passed
@@ -85,7 +80,9 @@ impl Searcher {
             limit
         };
 
-        let mut results = db.search(query_vector, fetch_limit as u64, min_score).await?;
+        let mut results = db
+            .search(query_vector, fetch_limit as u64, min_score)
+            .await?;
 
         // Apply reranking if enabled
         if reranker.is_enabled() && !results.is_empty() {
@@ -133,11 +130,14 @@ impl Searcher {
 
         if results.is_empty() {
             match format {
-                OutputFormat::Json => println!("{}", serde_json::json!({
-                    "query": query_text,
-                    "index_path": msrch_dir.display().to_string(),
-                    "results": []
-                })),
+                OutputFormat::Json => println!(
+                    "{}",
+                    serde_json::json!({
+                        "query": query_text,
+                        "index_path": msrch_dir.display().to_string(),
+                        "results": []
+                    })
+                ),
                 _ => println!("No results found."),
             }
             return Ok(());
@@ -155,8 +155,14 @@ impl Searcher {
     fn display_plain(&self, results: &[ScoredPoint]) {
         for result in results {
             let payload = &result.payload;
-            let file_path = payload.get("file_path").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let chunk_index = payload.get("chunk_index").and_then(|v| v.as_u64()).unwrap_or(0);
+            let file_path = payload
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let chunk_index = payload
+                .get("chunk_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
             println!("{}:{}", file_path, chunk_index);
         }
     }
@@ -167,15 +173,35 @@ impl Searcher {
             let score = result.score;
             let payload = &result.payload;
 
-            let file_path = payload.get("file_path").and_then(|v| v.as_str()).unwrap_or("unknown");
-            let chunk_index = payload.get("chunk_index").and_then(|v| v.as_u64()).unwrap_or(0);
-            let content = payload.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let file_path = payload
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let chunk_index = payload
+                .get("chunk_index")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let content = payload
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let context = payload
+                .get("context")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let context_suffix = if context.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", context.dimmed())
+            };
 
             println!(
-                "\n{} {}:{}",
+                "\n{} {}:{}{}",
                 format!("{:.2}", score).yellow(),
                 file_path.cyan(),
-                chunk_index
+                chunk_index,
+                context_suffix
             );
 
             for line in content.lines().take(3) {
@@ -200,6 +226,11 @@ impl Searcher {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
                     similarity: r.score,
+                    context: payload
+                        .get("context")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     content: payload
                         .get("content")
                         .and_then(|v| v.as_str())

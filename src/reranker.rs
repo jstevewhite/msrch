@@ -51,7 +51,11 @@ impl RerankerClient {
             return Ok(vec![]);
         }
 
-        debug!("rerank: sending {} documents to {}", documents.len(), self.config.endpoint);
+        debug!(
+            "rerank: sending {} documents to {}",
+            documents.len(),
+            self.config.endpoint
+        );
 
         let request = RerankRequest {
             model: self.config.model.clone(),
@@ -59,7 +63,8 @@ impl RerankerClient {
             documents,
         };
 
-        let response = self.client
+        let response = self
+            .client
             .post(&self.config.endpoint)
             .json(&request)
             .send()
@@ -71,7 +76,11 @@ impl RerankerClient {
 
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Rerank request failed with status {}: {}", status, error_text);
+            anyhow::bail!(
+                "Rerank request failed with status {}: {}",
+                status,
+                error_text
+            );
         }
 
         let rerank_response: RerankResponse = response

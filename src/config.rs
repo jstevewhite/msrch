@@ -140,7 +140,7 @@ pub struct RerankerConfig {
     pub enabled: bool,
     pub endpoint: String,
     pub model: String,
-    pub top_n: usize,  // How many candidates to fetch for reranking
+    pub top_n: usize, // How many candidates to fetch for reranking
 }
 
 impl Default for RerankerConfig {
@@ -149,7 +149,7 @@ impl Default for RerankerConfig {
             enabled: false,
             endpoint: "http://localhost:7995/rerank".to_string(),
             model: "BAAI/bge-reranker-large".to_string(),
-            top_n: 50,  // Fetch 50, rerank to top 10
+            top_n: 50, // Fetch 50, rerank to top 10
         }
     }
 }

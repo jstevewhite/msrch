@@ -1,12 +1,13 @@
+mod chunker;
 mod config;
 mod crawler;
-mod chunker;
-mod embedding;
 mod db;
+mod embedding;
 mod index;
 mod reranker;
 mod search;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -69,9 +70,7 @@ enum Commands {
     /// Show index statistics
     Stats,
     /// Find semantically similar files
-    Similar {
-        file: PathBuf,
-    },
+    Similar { file: PathBuf },
     /// Show effective configuration
     Config,
 }
@@ -110,40 +109,39 @@ async fn main() -> anyhow::Result<()> {
             // Resolve absolute path
             let root_path = std::fs::canonicalize(path).unwrap_or(path.clone());
             let indexer = index::Indexer::new(root_path, config);
-            match indexer.index().await {
-                Ok(_) => println!("Indexing completed successfully."),
-                Err(e) => eprintln!("Indexing failed: {}", e),
-            }
+            indexer.index().await.context("Indexing failed")?;
+            println!("Indexing completed successfully.");
         }
-        Commands::Query { text, limit, format, rerank } => {
-            let searcher = match search::Searcher::new(None).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("Initialization failed: {}", e);
-                    return Ok(());
-                }
-            };
-
-            if let Err(e) = searcher.search(text, *limit, *format, *rerank).await {
-                eprintln!("Search failed: {}", e);
-            }
+        Commands::Query {
+            text,
+            limit,
+            format,
+            rerank,
+        } => {
+            let searcher = search::Searcher::new(None)
+                .await
+                .context("Initialization failed")?;
+            searcher
+                .search(text, *limit, *format, *rerank)
+                .await
+                .context("Search failed")?;
         }
         Commands::Reindex => {
-             let config = config::Config::load_global_config().unwrap_or_default();
-             let current_dir = std::env::current_dir()?;
-             
-             // Use helper to find root or default to current
-             let root = index::find_index_root(&current_dir).unwrap_or(current_dir);
-             
-             let indexer = index::Indexer::new(root, config);
-             indexer.index().await?;
+            let current_dir = std::env::current_dir()?;
+            let root_path = index::find_index_root(&current_dir)
+                .context("No .msrch index found in directory tree")?;
+            let msrch_dir = root_path.join(".msrch");
+            if msrch_dir.exists() {
+                std::fs::remove_dir_all(&msrch_dir).context("Failed to remove old index")?;
+            }
+            let config = config::Config::load_global_config().unwrap_or_default();
+            let indexer = index::Indexer::new(root_path, config);
+            indexer.index().await.context("Reindexing failed")?;
+            println!("Reindexing completed successfully.");
         }
         Commands::Stats => {
             let current_dir = std::env::current_dir()?;
-            match index::get_stats(&current_dir).await {
-                Ok(stats) => stats.print(),
-                Err(e) => eprintln!("Failed to get stats: {}", e),
-            }
+            index::get_stats(&current_dir).await?.print();
         }
         Commands::Similar { file } => {
             use colored::*;
@@ -153,22 +151,14 @@ async fn main() -> anyhow::Result<()> {
             let file_path = std::fs::canonicalize(file).unwrap_or(file.clone());
 
             if !file_path.exists() {
-                eprintln!("File not found: {}", file_path.display());
-                return Ok(());
+                anyhow::bail!("File not found: {}", file_path.display());
             }
 
             // Read file content
-            let content = match std::fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to read file: {}", e);
-                    return Ok(());
-                }
-            };
+            let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
 
             if content.trim().is_empty() {
-                eprintln!("File is empty");
-                return Ok(());
+                anyhow::bail!("File is empty");
             }
 
             // Load config and create embedding client
@@ -176,13 +166,8 @@ async fn main() -> anyhow::Result<()> {
             let embedder = embedding::EmbeddingClient::new(config.embedding.clone())?;
 
             let current_dir = std::env::current_dir()?;
-            let index_root = match index::find_index_root(&current_dir) {
-                Some(root) => root,
-                None => {
-                    eprintln!("No .msrch index found in directory tree");
-                    return Ok(());
-                }
-            };
+            let index_root = index::find_index_root(&current_dir)
+                .context("No .msrch index found in directory tree")?;
 
             let msrch_dir = index_root.join(".msrch");
             let db = db::VectorDB::new(msrch_dir.join("index.db")).await?;
@@ -194,7 +179,10 @@ async fn main() -> anyhow::Result<()> {
                 content.clone()
             };
 
-            println!("Finding files similar to: {}", file_path.display().to_string().cyan());
+            println!(
+                "Finding files similar to: {}",
+                file_path.display().to_string().cyan()
+            );
 
             let embeddings = match embedder.embed(vec![truncated]).await {
                 Ok(e) => e,
@@ -217,7 +205,8 @@ async fn main() -> anyhow::Result<()> {
             let query_file_str = file_path.display().to_string();
 
             for result in results {
-                let result_file = result.payload
+                let result_file = result
+                    .payload
                     .get("file_path")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
@@ -241,13 +230,12 @@ async fn main() -> anyhow::Result<()> {
             if unique_results.is_empty() {
                 println!("No similar files found.");
             } else {
-                println!("{}", format!("\nFound {} similar files:", unique_results.len()).bold());
+                println!(
+                    "{}",
+                    format!("\nFound {} similar files:", unique_results.len()).bold()
+                );
                 for (file, score) in unique_results {
-                    println!(
-                        "  {} {}",
-                        format!("{:.2}", score).yellow(),
-                        file.cyan()
-                    );
+                    println!("  {} {}", format!("{:.2}", score).yellow(), file.cyan());
                 }
             }
         }
@@ -256,6 +244,6 @@ async fn main() -> anyhow::Result<()> {
             println!("{:#?}", config);
         }
     }
-    
+
     Ok(())
 }

@@ -1,6 +1,6 @@
 # msrch
 
-**msrch** is a local-first semantic search CLI tool for codebases. It creates per-directory indexes using embeddings and provides fast semantic queries that understand concepts, not just keywords.
+**msrch** is a local-first semantic search CLI tool. It contains optimizations for codebases, but works with any text-based data. It creates per-directory indexes using embeddings and provides fast semantic queries that understand concepts, not just keywords.
 
 ## Features
 
