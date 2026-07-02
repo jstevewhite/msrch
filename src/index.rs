@@ -15,9 +15,14 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 use std::time::SystemTime;
 
-/// Bump this whenever the on-disk vector schema changes (e.g. adding a column).
+/// Bump this whenever the on-disk vector schema OR chunk content/embedding
+/// semantics change (e.g. adding a column, or fixing how chunks are built).
 /// Indexes written with an older version are wiped and rebuilt on the next index run.
-const SCHEMA_VERSION: u32 = 1;
+///
+/// v1: added the `context` column.
+/// v2: fixed Rust doc-comment over-collection (changes stored content/embeddings).
+/// v3: resolve type/impl/Go-type names in the context path (was "anonymous").
+const SCHEMA_VERSION: u32 = 3;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {

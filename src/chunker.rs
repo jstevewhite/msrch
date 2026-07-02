@@ -955,60 +955,60 @@ impl Chunker {
 
 // Helper functions for extracting names from tree-sitter nodes
 
+/// Read the text of a node's `name` field, if present.
+fn field_name_text(node: Node, content: &str) -> Option<String> {
+    node.child_by_field_name("name")
+        .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+        .map(|s| s.to_string())
+}
+
 fn extract_rust_item_name(node: Node, content: &str) -> String {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "identifier" {
-            if let Ok(name) = child.utf8_text(content.as_bytes()) {
-                return name.to_string();
-            }
-        }
-    }
-    "anonymous".to_string()
+    // Most items expose a `name` field (function/struct/enum/trait/mod/const/static);
+    // `impl` blocks have no name, so fall back to the `type` they implement.
+    field_name_text(node, content)
+        .or_else(|| {
+            node.child_by_field_name("type")
+                .and_then(|n| n.utf8_text(content.as_bytes()).ok())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "anonymous".to_string())
 }
 
 fn extract_python_item_name(node: Node, content: &str) -> String {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "identifier" {
-            if let Ok(name) = child.utf8_text(content.as_bytes()) {
-                return name.to_string();
-            }
-        }
-    }
-    "anonymous".to_string()
+    // function_definition and class_definition both have a `name` field.
+    field_name_text(node, content).unwrap_or_else(|| "anonymous".to_string())
 }
 
 fn extract_js_item_name(node: Node, content: &str) -> String {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        if child.kind() == "identifier" || child.kind() == "property_identifier" {
-            if let Ok(name) = child.utf8_text(content.as_bytes()) {
-                return name.to_string();
-            }
-        }
-    }
-    "anonymous".to_string()
+    // Named declarations/methods have a `name` field; anonymous arrow/function
+    // expressions don't (their name lives on the enclosing declarator).
+    field_name_text(node, content).unwrap_or_else(|| "anonymous".to_string())
 }
 
 fn extract_go_item_name(node: Node, content: &str) -> String {
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        // For functions and methods, look for identifier or field_identifier
-        if child.kind() == "identifier"
-            || child.kind() == "field_identifier"
-            || child.kind() == "type_identifier"
-        {
-            if let Ok(name) = child.utf8_text(content.as_bytes()) {
-                return name.to_string();
+    // Go type declarations wrap the named spec: `type Foo struct {...}`
+    // parses as type_declaration > type_spec(name: Foo).
+    if node.kind() == "type_declaration" {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            if matches!(child.kind(), "type_spec" | "type_alias") {
+                if let Some(name) = field_name_text(child, content) {
+                    return name;
+                }
             }
         }
     }
-    "anonymous".to_string()
+
+    // function_declaration (identifier) and method_declaration (field_identifier)
+    // both expose a `name` field.
+    field_name_text(node, content).unwrap_or_else(|| "anonymous".to_string())
 }
 
 fn extract_rust_doc_comment(node: Node, content: &str) -> Option<String> {
-    // Look for preceding siblings that are line_comment starting with ///
+    // Collect only the contiguous run of `///` comments immediately preceding the
+    // item. We walk the parent's children in order and reset the accumulator on any
+    // node that breaks the run, so an item only inherits the doc block directly above
+    // it — not the doc comments of every earlier sibling in the same scope.
     let parent = node.parent()?;
     let mut cursor = parent.walk();
     let mut doc_lines = Vec::new();
@@ -1017,12 +1017,16 @@ fn extract_rust_doc_comment(node: Node, content: &str) -> Option<String> {
         if sibling.start_byte() >= node.start_byte() {
             break;
         }
-        if sibling.kind() == "line_comment" {
-            if let Ok(comment_text) = sibling.utf8_text(content.as_bytes()) {
-                if comment_text.starts_with("///") {
-                    doc_lines.push(comment_text);
-                }
-            }
+        match sibling.kind() {
+            "line_comment" => match sibling.utf8_text(content.as_bytes()) {
+                Ok(text) if text.starts_with("///") => doc_lines.push(text),
+                // A non-doc comment (`//`, `//!`, ...) ends the doc block.
+                _ => doc_lines.clear(),
+            },
+            // Attributes sit between the doc block and the item; they don't break it.
+            "attribute_item" => {}
+            // Any other node (another item, etc.) ends the contiguous doc block.
+            _ => doc_lines.clear(),
         }
     }
 
@@ -1178,5 +1182,78 @@ func (p *Person) GetName() string {
 
         let has_context = chunks.iter().any(|c| c.context.is_some());
         assert!(has_context, "Tree-sitter chunks should have context");
+    }
+
+    #[test]
+    fn test_rust_doc_comment_not_over_collected() {
+        let mut chunker = test_chunker_with_treesitter();
+        let path = PathBuf::from("docs.rs");
+        // Two documented functions in the same scope: `beta` must only carry its
+        // own doc comment, not accumulate `alpha`'s.
+        let content = r#"
+/// Doc for alpha.
+fn alpha() {
+    println!("a");
+}
+
+/// Doc for beta.
+fn beta() {
+    println!("b");
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+
+        let beta = chunks
+            .iter()
+            .find(|c| {
+                c.context
+                    .as_deref()
+                    .is_some_and(|ctx| ctx.ends_with("beta"))
+            })
+            .expect("should have a chunk for beta");
+
+        assert!(
+            beta.content.contains("Doc for beta"),
+            "beta should keep its own doc comment"
+        );
+        assert!(
+            !beta.content.contains("Doc for alpha"),
+            "beta must not inherit alpha's doc comment (over-collection regression)"
+        );
+    }
+
+    #[test]
+    fn test_rust_type_and_impl_names_resolved() {
+        let mut chunker = test_chunker_with_treesitter();
+        let path = PathBuf::from("named.rs");
+        let content = r#"
+pub struct Widget {
+    size: usize,
+}
+
+impl Widget {
+    fn new() -> Self {
+        Widget { size: 0 }
+    }
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let contexts: Vec<String> = chunks.iter().filter_map(|c| c.context.clone()).collect();
+
+        assert!(
+            contexts.iter().any(|c| c.contains("struct::Widget")),
+            "struct name should resolve to Widget, got: {:?}",
+            contexts
+        );
+        assert!(
+            contexts.iter().any(|c| c.contains("impl::Widget")),
+            "impl block should resolve to its type Widget, got: {:?}",
+            contexts
+        );
+        assert!(
+            contexts.iter().all(|c| !c.contains("anonymous")),
+            "no item should be anonymous, got: {:?}",
+            contexts
+        );
     }
 }
