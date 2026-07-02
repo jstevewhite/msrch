@@ -121,9 +121,7 @@ pub async fn get_stats(start_path: &Path) -> Result<IndexStats> {
     };
 
     // Get last modified time
-    let last_indexed = manifest.files.values()
-        .map(|m| m.modified_at)
-        .max();
+    let last_indexed = manifest.files.values().map(|m| m.modified_at).max();
 
     // Calculate index size
     fn dir_size(path: &Path) -> u64 {
