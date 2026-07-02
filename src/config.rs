@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct Config {
     pub embedding: EmbeddingConfig,
     pub chunking: ChunkingConfig,
@@ -25,6 +26,7 @@ impl Default for Config {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct EmbeddingConfig {
     pub endpoint: String,
     pub model: String,
@@ -48,6 +50,7 @@ impl Default for EmbeddingConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct ChunkingConfig {
     pub max_chunk_tokens: usize,
     pub overlap_tokens: usize,
@@ -77,6 +80,7 @@ impl Default for ChunkingConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct IndexingConfig {
     pub skip_binary: bool,
     pub follow_symlinks: bool,
@@ -104,6 +108,7 @@ impl Default for IndexingConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct QueryConfig {
     pub default_limit: usize,
     pub min_similarity: f32,
@@ -121,6 +126,7 @@ impl Default for QueryConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct DisplayConfig {
     pub show_similarity_scores: bool,
     pub color_output: bool,
@@ -136,6 +142,7 @@ impl Default for DisplayConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct RerankerConfig {
     pub enabled: bool,
     pub endpoint: String,
@@ -161,6 +168,21 @@ impl Config {
         confy::load("msrch", "config")
     }
 
+    /// Load the global config, falling back to defaults with a warning if the file
+    /// exists but can't be parsed. Prefer this over `.unwrap_or_default()` so an
+    /// outdated or malformed config surfaces a message instead of silently
+    /// masquerading as all-defaults. With `#[serde(default)]` on the config structs,
+    /// a config that is merely missing newer fields still loads cleanly.
+    pub fn load_global_config_or_default() -> Self {
+        match Self::load_global_config() {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!("warning: failed to load config, falling back to defaults: {e}");
+                Self::default()
+            }
+        }
+    }
+
     pub fn load_from_path(path: PathBuf) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&content)?;
@@ -168,4 +190,46 @@ impl Config {
     }
 
     // Example helper to merge/override configs could go here
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_tolerates_missing_fields_and_sections() {
+        // A config written before newer ChunkingConfig fields existed, and with
+        // the [embedding] section omitted entirely. This used to fail the whole
+        // parse and silently fall back to all-defaults.
+        let toml = r#"
+[chunking]
+max_chunk_tokens = 512
+overlap_tokens = 50
+max_file_size_mb = 10
+
+[reranker]
+enabled = true
+endpoint = "http://example.test:7995/rerank"
+top_n = 10
+"#;
+
+        let config: Config =
+            toml::from_str(toml).expect("missing fields/sections should default, not fail");
+
+        // Missing fields within a present section fall back to their defaults:
+        assert!(config.chunking.use_treesitter);
+        assert_eq!(config.chunking.treesitter_languages.len(), 5);
+        assert!(config.chunking.fallback_to_tokens);
+
+        // Values that ARE present are preserved (not clobbered by defaults):
+        assert!(config.reranker.enabled);
+        assert_eq!(config.reranker.endpoint, "http://example.test:7995/rerank");
+        assert_eq!(config.reranker.top_n, 10);
+
+        // A field missing from a present section defaults:
+        assert_eq!(config.reranker.model, RerankerConfig::default().model);
+
+        // An entirely-missing section defaults:
+        assert_eq!(config.embedding.model, EmbeddingConfig::default().model);
+    }
 }

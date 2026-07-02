@@ -43,7 +43,7 @@ impl Searcher {
 
         // Load config from index or global? For Search, mixing both is good.
         // For POC, just use global defaults/config.
-        let config = Config::load_global_config().unwrap_or_default();
+        let config = Config::load_global_config_or_default();
 
         Ok(Self { config, index_root })
     }

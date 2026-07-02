@@ -145,7 +145,7 @@ pub async fn get_stats(start_path: &Path) -> Result<IndexStats> {
     let size_on_disk = dir_size(&msrch_dir);
 
     // Load config for model info
-    let config = Config::load_global_config().unwrap_or_default();
+    let config = Config::load_global_config_or_default();
 
     Ok(IndexStats {
         index_path: msrch_dir,

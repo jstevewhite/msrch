@@ -105,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
                     .filter_level(log::LevelFilter::Debug)
                     .init();
             }
-            let config = config::Config::load_global_config().unwrap_or_default();
+            let config = config::Config::load_global_config_or_default();
             // Resolve absolute path
             let root_path = std::fs::canonicalize(path).unwrap_or(path.clone());
             let indexer = index::Indexer::new(root_path, config);
@@ -134,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
             if msrch_dir.exists() {
                 std::fs::remove_dir_all(&msrch_dir).context("Failed to remove old index")?;
             }
-            let config = config::Config::load_global_config().unwrap_or_default();
+            let config = config::Config::load_global_config_or_default();
             let indexer = index::Indexer::new(root_path, config);
             indexer.index().await.context("Reindexing failed")?;
             println!("Reindexing completed successfully.");
@@ -162,7 +162,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             // Load config and create embedding client
-            let config = config::Config::load_global_config().unwrap_or_default();
+            let config = config::Config::load_global_config_or_default();
             let embedder = embedding::EmbeddingClient::new(config.embedding.clone())?;
 
             let current_dir = std::env::current_dir()?;
@@ -240,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Config => {
-            let config = config::Config::load_global_config().unwrap_or_default();
+            let config = config::Config::load_global_config_or_default();
             println!("{:#?}", config);
         }
     }
