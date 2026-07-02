@@ -46,4 +46,8 @@ Thumbs.db
 *.db
 *.db-shm
 *.db-wal
+
+# Node (stray tooling artifacts — keep out of the index)
 node_modules/
+package.json
+package-lock.json
