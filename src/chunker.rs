@@ -36,6 +36,7 @@ enum CodeLanguage {
     Python,
     JavaScript,
     TypeScript,
+    Tsx,
     Go,
     Unsupported,
 }
@@ -46,6 +47,7 @@ pub struct Chunker {
     python_parser: Option<Parser>,
     javascript_parser: Option<Parser>,
     typescript_parser: Option<Parser>,
+    tsx_parser: Option<Parser>,
     go_parser: Option<Parser>,
 }
 
@@ -57,6 +59,7 @@ impl Chunker {
             python_parser: None,
             javascript_parser: None,
             typescript_parser: None,
+            tsx_parser: None,
             go_parser: None,
         };
 
@@ -69,7 +72,10 @@ impl Chunker {
     }
 
     fn init_parsers(&mut self) {
-        for lang in &self.config.treesitter_languages {
+        // Clone the small language list so the loop doesn't hold a borrow on
+        // `self.config` while we call `&mut self` helpers like `init_tsx_parser`.
+        let languages = self.config.treesitter_languages.clone();
+        for lang in &languages {
             match lang.as_str() {
                 "rust" => {
                     let mut parser = Parser::new();
@@ -110,7 +116,11 @@ impl Chunker {
                         self.typescript_parser = Some(parser);
                         debug!("Initialized TypeScript tree-sitter parser");
                     }
+                    // `.tsx` needs the JSX-aware grammar, so enabling TypeScript also
+                    // provisions the TSX parser.
+                    self.init_tsx_parser();
                 }
+                "tsx" => self.init_tsx_parser(),
                 "go" => {
                     let mut parser = Parser::new();
                     if parser
@@ -125,6 +135,20 @@ impl Chunker {
                     warn!("Unsupported tree-sitter language: {}", lang);
                 }
             }
+        }
+    }
+
+    fn init_tsx_parser(&mut self) {
+        if self.tsx_parser.is_some() {
+            return;
+        }
+        let mut parser = Parser::new();
+        if parser
+            .set_language(&tree_sitter_typescript::LANGUAGE_TSX.into())
+            .is_ok()
+        {
+            self.tsx_parser = Some(parser);
+            debug!("Initialized TSX tree-sitter parser");
         }
     }
 
@@ -165,7 +189,8 @@ impl Chunker {
             "rs" => CodeLanguage::Rust,
             "py" => CodeLanguage::Python,
             "js" | "jsx" => CodeLanguage::JavaScript,
-            "ts" | "tsx" => CodeLanguage::TypeScript,
+            "ts" => CodeLanguage::TypeScript,
+            "tsx" => CodeLanguage::Tsx,
             "go" => CodeLanguage::Go,
             _ => CodeLanguage::Unsupported,
         }
@@ -183,6 +208,7 @@ impl Chunker {
             CodeLanguage::Python => self.python_parser.as_mut(),
             CodeLanguage::JavaScript => self.javascript_parser.as_mut(),
             CodeLanguage::TypeScript => self.typescript_parser.as_mut(),
+            CodeLanguage::Tsx => self.tsx_parser.as_mut(),
             CodeLanguage::Go => self.go_parser.as_mut(),
             CodeLanguage::Unsupported => return Ok(None),
         };
@@ -221,7 +247,7 @@ impl Chunker {
             CodeLanguage::Python => {
                 self.extract_python_items(file_path, content, root_node, &bpe, &mut chunks)?
             }
-            CodeLanguage::JavaScript | CodeLanguage::TypeScript => {
+            CodeLanguage::JavaScript | CodeLanguage::TypeScript | CodeLanguage::Tsx => {
                 self.extract_js_items(file_path, content, root_node, &bpe, &mut chunks)?
             }
             CodeLanguage::Go => {
@@ -284,12 +310,10 @@ impl Chunker {
 
             if is_extractable {
                 if let Ok(text) = node.utf8_text(content.as_bytes()) {
-                    // Get doc comments if they exist
-                    let doc_comment = extract_rust_doc_comment(node, content);
-                    let full_text = if let Some(doc) = doc_comment {
-                        format!("{}\n{}", doc, text)
-                    } else {
-                        text.to_string()
+                    // Prepend any leading doc comments and attributes.
+                    let full_text = match extract_rust_leading(node, content) {
+                        Some(leading) => format!("{}\n{}", leading, text),
+                        None => text.to_string(),
                     };
 
                     let token_count = bpe.encode_with_special_tokens(&full_text).len();
@@ -395,8 +419,18 @@ impl Chunker {
             let is_extractable = matches!(kind, "function_definition" | "class_definition");
 
             if is_extractable {
-                if let Ok(text) = node.utf8_text(content.as_bytes()) {
-                    let token_count = bpe.encode_with_special_tokens(text).len();
+                // A decorated def parses as `decorated_definition > (decorator..., def)`;
+                // anchor on the wrapper so the chunk carries its decorators.
+                let anchor = node
+                    .parent()
+                    .filter(|p| p.kind() == "decorated_definition")
+                    .unwrap_or(node);
+                if let Ok(text) = anchor.utf8_text(content.as_bytes()) {
+                    let full_text = match extract_leading_comments(anchor, content) {
+                        Some(comment) => format!("{}\n{}", comment, text),
+                        None => text.to_string(),
+                    };
+                    let token_count = bpe.encode_with_special_tokens(&full_text).len();
 
                     if token_count <= max_tokens {
                         let item_name = extract_python_item_name(node, content);
@@ -427,7 +461,7 @@ impl Chunker {
                             id: Uuid::new_v4(),
                             file_path: file_path.clone(),
                             chunk_index: *chunk_idx,
-                            content: text.to_string(),
+                            content: full_text,
                             token_count,
                             context: Some(new_context.clone()),
                         });
@@ -513,17 +547,28 @@ impl Chunker {
                     | "class_declaration"
                     | "arrow_function"
                     | "function_expression"
+                    // TypeScript-only top-level constructs.
+                    | "interface_declaration"
+                    | "enum_declaration"
+                    | "type_alias_declaration"
             );
 
             if is_extractable {
                 if let Ok(text) = node.utf8_text(content.as_bytes()) {
-                    let token_count = bpe.encode_with_special_tokens(text).len();
+                    let full_text = match extract_leading_comments(node, content) {
+                        Some(comment) => format!("{}\n{}", comment, text),
+                        None => text.to_string(),
+                    };
+                    let token_count = bpe.encode_with_special_tokens(&full_text).len();
 
                     if token_count <= max_tokens {
                         let item_name = extract_js_item_name(node, content);
                         let item_type = match kind {
                             "class_declaration" => "class",
                             "method_definition" => "method",
+                            "interface_declaration" => "interface",
+                            "enum_declaration" => "enum",
+                            "type_alias_declaration" => "type",
                             _ => "fn",
                         };
                         let new_context = if context_path.is_empty() {
@@ -536,7 +581,7 @@ impl Chunker {
                             id: Uuid::new_v4(),
                             file_path: file_path.clone(),
                             chunk_index: *chunk_idx,
-                            content: text.to_string(),
+                            content: full_text,
                             token_count,
                             context: Some(new_context.clone()),
                         });
@@ -617,18 +662,28 @@ impl Chunker {
 
             let is_extractable = matches!(
                 kind,
-                "function_declaration" | "method_declaration" | "type_declaration"
+                "function_declaration"
+                    | "method_declaration"
+                    | "type_declaration"
+                    | "const_declaration"
+                    | "var_declaration"
             );
 
             if is_extractable {
                 if let Ok(text) = node.utf8_text(content.as_bytes()) {
-                    let token_count = bpe.encode_with_special_tokens(text).len();
+                    let full_text = match extract_leading_comments(node, content) {
+                        Some(comment) => format!("{}\n{}", comment, text),
+                        None => text.to_string(),
+                    };
+                    let token_count = bpe.encode_with_special_tokens(&full_text).len();
 
                     if token_count <= max_tokens {
                         let item_name = extract_go_item_name(node, content);
                         let item_type = match kind {
                             "type_declaration" => "type",
                             "method_declaration" => "method",
+                            "const_declaration" => "const",
+                            "var_declaration" => "var",
                             _ => "fn",
                         };
                         let new_context = if context_path.is_empty() {
@@ -641,7 +696,7 @@ impl Chunker {
                             id: Uuid::new_v4(),
                             file_path: file_path.clone(),
                             chunk_index: *chunk_idx,
-                            content: text.to_string(),
+                            content: full_text,
                             token_count,
                             context: Some(new_context.clone()),
                         });
@@ -986,12 +1041,19 @@ fn extract_js_item_name(node: Node, content: &str) -> String {
 }
 
 fn extract_go_item_name(node: Node, content: &str) -> String {
-    // Go type declarations wrap the named spec: `type Foo struct {...}`
-    // parses as type_declaration > type_spec(name: Foo).
-    if node.kind() == "type_declaration" {
+    // Go wraps named specs: `type Foo struct {...}` parses as
+    // type_declaration > type_spec(name: Foo); const/var declarations wrap
+    // const_spec/var_spec the same way (using the first name of a group).
+    let spec_kinds: &[&str] = match node.kind() {
+        "type_declaration" => &["type_spec", "type_alias"],
+        "const_declaration" => &["const_spec"],
+        "var_declaration" => &["var_spec"],
+        _ => &[],
+    };
+    if !spec_kinds.is_empty() {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
-            if matches!(child.kind(), "type_spec" | "type_alias") {
+            if spec_kinds.contains(&child.kind()) {
                 if let Some(name) = field_name_text(child, content) {
                     return name;
                 }
@@ -1004,14 +1066,15 @@ fn extract_go_item_name(node: Node, content: &str) -> String {
     field_name_text(node, content).unwrap_or_else(|| "anonymous".to_string())
 }
 
-fn extract_rust_doc_comment(node: Node, content: &str) -> Option<String> {
-    // Collect only the contiguous run of `///` comments immediately preceding the
-    // item. We walk the parent's children in order and reset the accumulator on any
-    // node that breaks the run, so an item only inherits the doc block directly above
-    // it — not the doc comments of every earlier sibling in the same scope.
+fn extract_rust_leading(node: Node, content: &str) -> Option<String> {
+    // Collect the contiguous run of `///` doc comments and `#[...]` attributes
+    // immediately preceding the item, preserving source order. We walk the parent's
+    // children in order and reset the accumulator on any node that breaks the run, so
+    // an item only inherits the block directly above it — not the docs or attributes
+    // of an earlier sibling in the same scope.
     let parent = node.parent()?;
     let mut cursor = parent.walk();
-    let mut doc_lines = Vec::new();
+    let mut leading = Vec::new();
 
     for sibling in parent.children(&mut cursor) {
         if sibling.start_byte() >= node.start_byte() {
@@ -1019,21 +1082,57 @@ fn extract_rust_doc_comment(node: Node, content: &str) -> Option<String> {
         }
         match sibling.kind() {
             "line_comment" => match sibling.utf8_text(content.as_bytes()) {
-                Ok(text) if text.starts_with("///") => doc_lines.push(text),
-                // A non-doc comment (`//`, `//!`, ...) ends the doc block.
-                _ => doc_lines.clear(),
+                Ok(text) if text.starts_with("///") => leading.push(text),
+                // A non-doc comment (`//`, `//!`, ...) ends the run.
+                _ => leading.clear(),
             },
-            // Attributes sit between the doc block and the item; they don't break it.
-            "attribute_item" => {}
-            // Any other node (another item, etc.) ends the contiguous doc block.
-            _ => doc_lines.clear(),
+            // Attributes sit between the doc block and the item; keep them and let
+            // the run continue (a `///` above an attribute still belongs to the item).
+            "attribute_item" => {
+                if let Ok(text) = sibling.utf8_text(content.as_bytes()) {
+                    leading.push(text);
+                }
+            }
+            // Any other node (another item, etc.) ends the contiguous run.
+            _ => leading.clear(),
         }
     }
 
-    if doc_lines.is_empty() {
+    if leading.is_empty() {
         None
     } else {
-        Some(doc_lines.join("\n"))
+        Some(leading.join("\n"))
+    }
+}
+
+/// Collect the contiguous run of `comment` nodes immediately preceding `node`
+/// within its parent. Mirrors `extract_rust_doc_comment` but generalizes to the
+/// single `comment` node kind that the Python/JS/Go grammars use (JSDoc `/** */`
+/// blocks, Go `//` doc lines, Python `#` comments). Any non-comment sibling
+/// resets the run, so an item only inherits the comment block directly above it
+/// — not the trailing comment of an earlier sibling.
+fn extract_leading_comments(node: Node, content: &str) -> Option<String> {
+    let parent = node.parent()?;
+    let mut cursor = parent.walk();
+    let mut comment_lines: Vec<&str> = Vec::new();
+
+    for sibling in parent.children(&mut cursor) {
+        if sibling.start_byte() >= node.start_byte() {
+            break;
+        }
+        if sibling.kind() == "comment" {
+            if let Ok(text) = sibling.utf8_text(content.as_bytes()) {
+                comment_lines.push(text);
+            }
+        } else {
+            comment_lines.clear();
+        }
+    }
+
+    if comment_lines.is_empty() {
+        None
+    } else {
+        Some(comment_lines.join("\n"))
     }
 }
 
@@ -1254,6 +1353,568 @@ impl Widget {
             contexts.iter().all(|c| !c.contains("anonymous")),
             "no item should be anonymous, got: {:?}",
             contexts
+        );
+    }
+
+    fn treesitter_chunker(langs: &[&str]) -> Chunker {
+        Chunker::new(ChunkingConfig {
+            max_chunk_tokens: 512,
+            overlap_tokens: 50,
+            max_file_size_mb: 10,
+            use_treesitter: true,
+            treesitter_languages: langs.iter().map(|s| s.to_string()).collect(),
+            fallback_to_tokens: true,
+        })
+    }
+
+    #[test]
+    fn test_python_chunk_includes_leading_comment() {
+        let mut chunker = treesitter_chunker(&["python"]);
+        let path = PathBuf::from("commented.py");
+        let content = r#"
+# Greets the caller warmly.
+def greet():
+    print("hi")
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let greet = chunks
+            .iter()
+            .find(|c| {
+                c.context
+                    .as_deref()
+                    .is_some_and(|ctx| ctx.ends_with("greet"))
+            })
+            .expect("should have a chunk for greet");
+        assert!(
+            greet.content.contains("Greets the caller warmly"),
+            "python chunk should carry its leading comment, got: {:?}",
+            greet.content
+        );
+    }
+
+    #[test]
+    fn test_python_chunk_includes_decorator() {
+        let mut chunker = treesitter_chunker(&["python"]);
+        let path = PathBuf::from("decorated.py");
+        let content = r#"
+@cached
+def build():
+    return 1
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let build = chunks
+            .iter()
+            .find(|c| {
+                c.context
+                    .as_deref()
+                    .is_some_and(|ctx| ctx.ends_with("build"))
+            })
+            .expect("should have a chunk for build");
+        assert!(
+            build.content.contains("@cached"),
+            "python chunk should carry its decorator, got: {:?}",
+            build.content
+        );
+    }
+
+    #[test]
+    fn test_javascript_chunk_includes_jsdoc() {
+        let mut chunker = treesitter_chunker(&["javascript"]);
+        let path = PathBuf::from("doc.js");
+        let content = r#"
+/** Adds two numbers. */
+function add(a, b) {
+    return a + b;
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let add = chunks
+            .iter()
+            .find(|c| c.context.as_deref().is_some_and(|ctx| ctx.ends_with("add")))
+            .expect("should have a chunk for add");
+        assert!(
+            add.content.contains("Adds two numbers"),
+            "js chunk should carry its jsdoc, got: {:?}",
+            add.content
+        );
+    }
+
+    #[test]
+    fn test_go_chunk_includes_doc_comment() {
+        let mut chunker = treesitter_chunker(&["go"]);
+        let path = PathBuf::from("doc.go");
+        let content = r#"
+package main
+
+// Hello prints a greeting.
+func Hello() {
+    println("hello")
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let hello = chunks
+            .iter()
+            .find(|c| {
+                c.context
+                    .as_deref()
+                    .is_some_and(|ctx| ctx.ends_with("Hello"))
+            })
+            .expect("should have a chunk for Hello");
+        assert!(
+            hello.content.contains("Hello prints a greeting"),
+            "go chunk should carry its doc comment, got: {:?}",
+            hello.content
+        );
+    }
+
+    #[test]
+    fn test_go_doc_comment_not_over_collected() {
+        let mut chunker = treesitter_chunker(&["go"]);
+        let path = PathBuf::from("multi.go");
+        let content = r#"
+package main
+
+// Alpha does the first thing.
+func Alpha() {
+    println("a")
+}
+
+// Beta does the second thing.
+func Beta() {
+    println("b")
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let beta = chunks
+            .iter()
+            .find(|c| {
+                c.context
+                    .as_deref()
+                    .is_some_and(|ctx| ctx.ends_with("Beta"))
+            })
+            .expect("should have a chunk for Beta");
+        assert!(
+            beta.content.contains("Beta does the second thing"),
+            "Beta should keep its own doc comment, got: {:?}",
+            beta.content
+        );
+        assert!(
+            !beta.content.contains("Alpha does the first thing"),
+            "Beta must not inherit Alpha's doc comment (over-collection), got: {:?}",
+            beta.content
+        );
+    }
+
+    #[test]
+    fn test_rust_chunk_includes_attributes() {
+        let mut chunker = treesitter_chunker(&["rust"]);
+        let path = PathBuf::from("attrs.rs");
+        let content = r#"
+#[derive(Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Config {
+    name: String,
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let config = chunks
+            .iter()
+            .find(|c| {
+                c.context
+                    .as_deref()
+                    .is_some_and(|ctx| ctx.ends_with("Config"))
+            })
+            .expect("should have a chunk for Config");
+        assert!(
+            config.content.contains("#[derive(Debug, Clone)]"),
+            "rust chunk should carry its derive attribute, got: {:?}",
+            config.content
+        );
+        assert!(
+            config.content.contains("#[serde"),
+            "rust chunk should carry its serde attribute, got: {:?}",
+            config.content
+        );
+    }
+
+    #[test]
+    fn test_typescript_chunk_extracts_enum() {
+        let mut chunker = treesitter_chunker(&["typescript"]);
+        let path = PathBuf::from("color.ts");
+        let content = r#"
+enum Color {
+    Red,
+    Green,
+    Blue,
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let color = chunks
+            .iter()
+            .find(|c| {
+                c.context
+                    .as_deref()
+                    .is_some_and(|ctx| ctx.contains("enum::Color"))
+            })
+            .expect("should extract a semantic chunk for enum Color");
+        assert!(
+            color.content.contains("enum Color"),
+            "enum chunk should carry its body, got: {:?}",
+            color.content
+        );
+    }
+
+    #[test]
+    fn test_typescript_chunk_extracts_interface() {
+        let mut chunker = treesitter_chunker(&["typescript"]);
+        let path = PathBuf::from("user.ts");
+        let content = r#"
+interface User {
+    name: string;
+    age: number;
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let user = chunks
+            .iter()
+            .find(|c| {
+                c.context
+                    .as_deref()
+                    .is_some_and(|ctx| ctx.contains("interface::User"))
+            })
+            .expect("should extract a semantic chunk for interface User");
+        assert!(
+            user.content.contains("interface User"),
+            "interface chunk should carry its body, got: {:?}",
+            user.content
+        );
+    }
+
+    #[test]
+    fn test_go_chunk_extracts_const_and_var() {
+        let mut chunker = treesitter_chunker(&["go"]);
+        let path = PathBuf::from("decls.go");
+        let content = r#"
+package main
+
+const MaxSize = 100
+
+var GlobalName = "test"
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let contexts: Vec<String> = chunks.iter().filter_map(|c| c.context.clone()).collect();
+        assert!(
+            contexts.iter().any(|c| c.contains("MaxSize")),
+            "should extract a chunk for the const, got: {:?}",
+            contexts
+        );
+        assert!(
+            contexts.iter().any(|c| c.contains("GlobalName")),
+            "should extract a chunk for the var, got: {:?}",
+            contexts
+        );
+    }
+
+    // ---- Ported characterization coverage (adapted from the feature branch) ----
+
+    #[test]
+    fn test_code_no_blank_lines_single_segment() {
+        let chunker = test_chunker();
+        let segments = chunker.split_code("fn foo() {\n    1\n}");
+        assert_eq!(segments.len(), 1);
+    }
+
+    #[test]
+    fn test_markdown_splitting_on_headers() {
+        let chunker = test_chunker();
+        let content = "# Title\n\nIntro paragraph.\n\n## Section\n\nSection content.";
+        let segments = chunker.split_markdown(content);
+        assert!(segments.len() >= 2, "got {} segments", segments.len());
+    }
+
+    #[test]
+    fn test_prose_splitting_on_paragraphs() {
+        let chunker = test_chunker();
+        let content = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.";
+        let segments = chunker.split_prose(content);
+        assert_eq!(segments.len(), 3);
+    }
+
+    #[test]
+    fn test_whitespace_only_returns_empty() {
+        let mut chunker = test_chunker();
+        let path = PathBuf::from("whitespace.txt");
+        let chunks = chunker.chunk_file(&path, "   \n\n  \t  ").unwrap();
+        assert!(chunks.is_empty());
+    }
+
+    #[test]
+    fn test_chunk_indices_are_sequential() {
+        let mut chunker = test_chunker();
+        let path = PathBuf::from("seq.rs");
+        let content = "fn one() {}\n\nfn two() {}\n\nfn three() {}";
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        for (i, chunk) in chunks.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, i);
+        }
+    }
+
+    #[test]
+    fn test_chunk_ids_are_unique() {
+        let mut chunker = test_chunker();
+        let path = PathBuf::from("ids.md");
+        let content = "# One\n\nParagraph.\n\n# Two\n\nAnother.";
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let ids: std::collections::HashSet<_> = chunks.iter().map(|c| c.id).collect();
+        assert_eq!(ids.len(), chunks.len(), "all chunk IDs should be unique");
+    }
+
+    #[test]
+    fn test_large_content_splits_by_tokens() {
+        let mut chunker = test_chunker(); // max_chunk_tokens = 100
+        let path = PathBuf::from("big.txt");
+        let content = "word ".repeat(200);
+        let chunks = chunker.chunk_file(&path, &content).unwrap();
+        assert!(
+            chunks.len() > 1,
+            "large content should split into many chunks"
+        );
+        for chunk in &chunks {
+            assert!(
+                chunk.token_count <= 100,
+                "each chunk should respect max_tokens, got {}",
+                chunk.token_count
+            );
+        }
+    }
+
+    #[test]
+    fn test_rust_extracts_all_item_types() {
+        let mut chunker = treesitter_chunker(&["rust"]);
+        let path = PathBuf::from("all.rs");
+        let content = r#"
+const MAX_SIZE: usize = 100;
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+enum Color {
+    Red,
+    Green,
+}
+
+trait Drawable {
+    fn draw(&self);
+}
+
+impl Drawable for Point {
+    fn draw(&self) {}
+}
+
+fn main() {}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let contexts: Vec<String> = chunks.iter().filter_map(|c| c.context.clone()).collect();
+        for expected in [
+            "const::MAX_SIZE",
+            "struct::Point",
+            "enum::Color",
+            "trait::Drawable",
+            "impl::Point",
+            "function::main",
+        ] {
+            assert!(
+                contexts.iter().any(|c| c.contains(expected)),
+                "expected a chunk with context containing {expected:?}, got: {contexts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rust_no_blank_lines_still_splits() {
+        let mut chunker = treesitter_chunker(&["rust"]);
+        let path = PathBuf::from("dense.rs");
+        let content = "fn first() { 1 }\nfn second() { 2 }\nfn third() { 3 }";
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let contexts: Vec<String> = chunks.iter().filter_map(|c| c.context.clone()).collect();
+        for name in ["function::first", "function::second", "function::third"] {
+            assert!(
+                contexts.iter().any(|c| c.contains(name)),
+                "AST chunking should split adjacent items; missing {name:?} in {contexts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rust_fallback_on_invalid() {
+        let mut chunker = treesitter_chunker(&["rust"]);
+        let path = PathBuf::from("invalid.rs");
+        let content = "this is not valid rust code at all\n\nmore invalid stuff";
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        assert!(
+            !chunks.is_empty(),
+            "unparseable code should still yield fallback chunks"
+        );
+    }
+
+    #[test]
+    fn test_go_extracts_all_item_types() {
+        let mut chunker = treesitter_chunker(&["go"]);
+        let path = PathBuf::from("all.go");
+        let content = r#"
+package main
+
+const MaxSize = 100
+
+var GlobalVar = "test"
+
+type Point struct {
+    X int
+}
+
+func (p Point) Draw() {}
+
+func main() {}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let contexts: Vec<String> = chunks.iter().filter_map(|c| c.context.clone()).collect();
+        for expected in [
+            "const::MaxSize",
+            "var::GlobalVar",
+            "type::Point",
+            "method::Draw",
+            "fn::main",
+        ] {
+            assert!(
+                contexts.iter().any(|c| c.contains(expected)),
+                "expected a chunk with context containing {expected:?}, got: {contexts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_python_extracts_class_and_function() {
+        let mut chunker = treesitter_chunker(&["python"]);
+        let path = PathBuf::from("shapes.py");
+        let content = r#"
+class Point:
+    def draw(self):
+        print(self.x)
+
+def main():
+    pass
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let contexts: Vec<String> = chunks.iter().filter_map(|c| c.context.clone()).collect();
+        assert!(
+            contexts.iter().any(|c| c.contains("class::Point")),
+            "expected a class chunk, got: {contexts:?}"
+        );
+        assert!(
+            contexts.iter().any(|c| c.contains("fn::main")),
+            "expected a function chunk, got: {contexts:?}"
+        );
+    }
+
+    #[test]
+    fn test_javascript_extracts_class_and_function() {
+        let mut chunker = treesitter_chunker(&["javascript"]);
+        let path = PathBuf::from("shapes.js");
+        let content = r#"
+class Point {
+    constructor(x) {
+        this.x = x;
+    }
+}
+
+function main() {
+    return new Point(0);
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let contexts: Vec<String> = chunks.iter().filter_map(|c| c.context.clone()).collect();
+        assert!(
+            contexts.iter().any(|c| c.contains("class::Point")),
+            "expected a class chunk, got: {contexts:?}"
+        );
+        assert!(
+            contexts.iter().any(|c| c.contains("fn::main")),
+            "expected a function chunk, got: {contexts:?}"
+        );
+    }
+
+    #[test]
+    fn test_typescript_parsing_interface_type_and_function() {
+        let mut chunker = treesitter_chunker(&["typescript"]);
+        let path = PathBuf::from("types.ts");
+        let content = r#"
+interface User {
+    name: string;
+}
+
+type ID = string | number;
+
+function greet(user: User): void {
+    console.log(user.name);
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let contexts: Vec<String> = chunks.iter().filter_map(|c| c.context.clone()).collect();
+        for expected in ["interface::User", "type::ID", "fn::greet"] {
+            assert!(
+                contexts.iter().any(|c| c.contains(expected)),
+                "expected a chunk with context containing {expected:?}, got: {contexts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_chunk_file_routes_by_extension() {
+        let mut chunker = treesitter_chunker(&["go", "python", "javascript", "typescript"]);
+        let cases = [
+            ("test.go", "package main\n\nfunc foo() {}\n\nfunc bar() {}"),
+            ("test.py", "def foo():\n    pass\n\ndef bar():\n    pass"),
+            ("test.js", "function foo() {}\n\nfunction bar() {}"),
+            (
+                "test.ts",
+                "function foo(): void {}\n\nfunction bar(): void {}",
+            ),
+        ];
+        for (name, content) in cases {
+            let chunks = chunker.chunk_file(&PathBuf::from(name), content).unwrap();
+            assert!(!chunks.is_empty(), "{name} should produce chunks");
+            assert!(
+                chunks.iter().any(|c| c.context.is_some()),
+                "{name} should produce at least one semantic chunk"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tsx_chunk_extracts_component() {
+        // Enabling "typescript" should also parse `.tsx` (JSX-bearing) files.
+        let mut chunker = treesitter_chunker(&["typescript"]);
+        let path = PathBuf::from("Greeting.tsx");
+        let content = r#"
+interface Props {
+    name: string;
+}
+
+function Greeting({ name }: Props) {
+    return <div>Hello, {name}!</div>;
+}
+"#;
+        let chunks = chunker.chunk_file(&path, content).unwrap();
+        let contexts: Vec<String> = chunks.iter().filter_map(|c| c.context.clone()).collect();
+        assert!(
+            contexts.iter().any(|c| c.contains("fn::Greeting")),
+            "TSX component should be extracted as a semantic chunk, got: {contexts:?}"
+        );
+        assert!(
+            contexts.iter().any(|c| c.contains("interface::Props")),
+            "TSX interface should be extracted, got: {contexts:?}"
         );
     }
 }

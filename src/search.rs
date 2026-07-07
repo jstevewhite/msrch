@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use colored::*;
 use log::debug;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 
@@ -147,6 +148,7 @@ impl Searcher {
             OutputFormat::Plain => self.display_plain(&results),
             OutputFormat::Context => self.display_context(&results),
             OutputFormat::Json => self.display_json(query_text, &msrch_dir, &results),
+            OutputFormat::Filename => self.display_filename(&results),
         }
 
         Ok(())
@@ -247,5 +249,59 @@ impl Searcher {
         };
 
         println!("{}", serde_json::to_string_pretty(&output).unwrap());
+    }
+
+    fn display_filename(&self, results: &[ScoredPoint]) {
+        for file_path in unique_file_paths(results) {
+            println!("{}", file_path);
+        }
+    }
+}
+
+/// Collect the distinct `file_path` values from results, preserving the order
+/// in which each path is first seen (so the most relevant file leads).
+fn unique_file_paths(results: &[ScoredPoint]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut paths = Vec::new();
+    for result in results {
+        let file_path = result
+            .payload
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        if seen.insert(file_path.clone()) {
+            paths.push(file_path);
+        }
+    }
+    paths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn point(file_path: &str) -> ScoredPoint {
+        ScoredPoint {
+            id: "id".to_string(),
+            score: 1.0,
+            payload: json!({ "file_path": file_path }),
+        }
+    }
+
+    #[test]
+    fn unique_file_paths_dedupes_preserving_first_seen_order() {
+        let results = vec![
+            point("src/a.rs"),
+            point("src/b.rs"),
+            point("src/a.rs"),
+            point("src/c.rs"),
+            point("src/b.rs"),
+        ];
+        assert_eq!(
+            unique_file_paths(&results),
+            vec!["src/a.rs", "src/b.rs", "src/c.rs"]
+        );
     }
 }

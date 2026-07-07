@@ -20,6 +20,8 @@ pub enum OutputFormat {
     Context,
     /// JSON output for scripting
     Json,
+    /// Deduplicated file paths only (like `grep -l`)
+    Filename,
 }
 
 #[derive(Parser)]
