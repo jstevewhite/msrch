@@ -11,7 +11,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
 pub enum OutputFormat {
     /// File paths only
     Plain,
@@ -32,7 +32,10 @@ struct Cli {
     command: Option<Commands>,
 
     /// Implicit search query (shorthand for `msrch query "text"`)
-    #[arg(trailing_var_arg = true)]
+    ///
+    /// Collected as positional words so unquoted multi-word queries work; global
+    /// flags like `--format`/`--limit` are still parsed even when placed after the
+    /// query text (do not re-add `trailing_var_arg`, which swallows them).
     query_args: Vec<String>,
 
     /// Max results (for implicit query)
@@ -248,4 +251,35 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn implicit_query_honors_trailing_format_flag() {
+        let cli = Cli::try_parse_from(["msrch", "find the chunker", "--format", "filename"])
+            .expect("should parse");
+        assert!(cli.command.is_none(), "no subcommand => implicit query");
+        assert_eq!(cli.query_args, vec!["find the chunker".to_string()]);
+        assert_eq!(cli.format, Some(OutputFormat::Filename));
+    }
+
+    #[test]
+    fn implicit_query_honors_trailing_limit_flag() {
+        let cli = Cli::try_parse_from(["msrch", "find the chunker", "--limit", "3"])
+            .expect("should parse");
+        assert_eq!(cli.limit, Some(3));
+        assert_eq!(cli.query_args, vec!["find the chunker".to_string()]);
+    }
+
+    #[test]
+    fn implicit_query_collects_unquoted_words() {
+        // Multi-word queries without quotes still collect as positional words.
+        let cli = Cli::try_parse_from(["msrch", "find", "the", "chunker"]).expect("should parse");
+        assert_eq!(cli.query_args, vec!["find", "the", "chunker"]);
+        assert!(cli.format.is_none());
+    }
 }
