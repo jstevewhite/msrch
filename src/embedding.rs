@@ -3,7 +3,16 @@ use anyhow::{Context, Result};
 use log::debug;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::time::{Duration, Instant};
+
+/// Abstraction over embedding backends so indexing can be tested without a live API.
+pub trait Embedder: Send + Sync {
+    fn embed(
+        &self,
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>>> + Send;
+}
 
 #[derive(Serialize)]
 struct EmbeddingRequest {
@@ -104,5 +113,74 @@ impl EmbeddingClient {
             embeddings.first().map(|e| e.len()).unwrap_or(0)
         );
         Ok(embeddings)
+    }
+}
+
+impl Embedder for EmbeddingClient {
+    fn embed(
+        &self,
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>>> + Send {
+        EmbeddingClient::embed(self, texts)
+    }
+}
+
+/// Deterministic embedder for tests. Optionally fails after N successful calls.
+#[cfg(test)]
+pub struct FakeEmbedder {
+    dim: usize,
+    /// Fail on the call with this 0-based index (after this many prior successes).
+    fail_at_call: Option<usize>,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl FakeEmbedder {
+    pub fn new(dim: usize) -> Self {
+        Self {
+            dim,
+            fail_at_call: None,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Fail starting at the given 0-based call index (0 = fail immediately).
+    pub fn fail_at(dim: usize, call_index: usize) -> Self {
+        Self {
+            dim,
+            fail_at_call: Some(call_index),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Embedder for FakeEmbedder {
+    fn embed(
+        &self,
+        texts: Vec<String>,
+    ) -> impl Future<Output = Result<Vec<Vec<f32>>>> + Send {
+        use std::sync::atomic::Ordering;
+        let dim = self.dim;
+        let fail_at = self.fail_at_call;
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        async move {
+            if fail_at == Some(call) {
+                anyhow::bail!("fake embedder failure at call {call}");
+            }
+            Ok(texts
+                .iter()
+                .enumerate()
+                .map(|(i, t)| {
+                    let mut v = vec![0.0_f32; dim];
+                    // Distinct, stable vectors so cosine search can tell docs apart.
+                    v[0] = (t.len() as f32) + (i as f32) * 0.01;
+                    if dim > 1 {
+                        v[1] = (call as f32) + 1.0;
+                    }
+                    v
+                })
+                .collect())
+        }
     }
 }

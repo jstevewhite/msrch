@@ -46,9 +46,25 @@ impl Crawler {
                 Ok(entry) => {
                     let path = entry.path();
                     if path.is_file() {
-                        if !self.is_binary(path)? {
-                            // Can also check file size here if needed
-                            files.push(path.to_path_buf());
+                        match self.is_binary(path) {
+                            Ok(true) => {
+                                // Skip binary files when configured.
+                            }
+                            Ok(false) => {
+                                // Can also check file size here if needed
+                                files.push(path.to_path_buf());
+                            }
+                            Err(e) => {
+                                // Unreadable files are still returned so the indexer can
+                                // retain a prior manifest entry instead of treating them
+                                // as deleted (which would wipe their vectors).
+                                eprintln!(
+                                    "Warning: could not inspect {}: {} (including path for indexer)",
+                                    path.display(),
+                                    e
+                                );
+                                files.push(path.to_path_buf());
+                            }
                         }
                     }
                 }

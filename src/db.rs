@@ -183,6 +183,9 @@ impl VectorDB {
         Ok(count)
     }
 
+    /// Delete rows by chunk UUID. Prefer [`Self::delete_by_file_path`] when
+    /// re-indexing so orphans without recorded IDs are also cleared.
+    #[allow(dead_code)]
     pub async fn delete_by_ids(&self, ids: &[Uuid]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -199,7 +202,6 @@ impl VectorDB {
             .execute()
             .await?;
 
-        // Build a filter expression for all IDs: id IN ('id1', 'id2', ...)
         let id_strings: Vec<String> = ids.iter().map(|id| format!("'{}'", id)).collect();
         let filter = format!("id IN ({})", id_strings.join(", "));
 
@@ -212,6 +214,63 @@ impl VectorDB {
         debug!("delete_by_ids: deletion completed");
 
         Ok(())
+    }
+
+    /// Delete all vectors whose `file_path` column equals `file_path`.
+    ///
+    /// Used before re-indexing a file so orphan rows from a partial prior run
+    /// are cleared even when their IDs are not recorded in the manifest.
+    /// Missing table is a no-op.
+    pub async fn delete_by_file_path(&self, file_path: &str) -> Result<()> {
+        let table_names = self.connection.table_names().execute().await?;
+        if !table_names.contains(&self.table_name) {
+            return Ok(());
+        }
+
+        let table = self
+            .connection
+            .open_table(&self.table_name)
+            .execute()
+            .await?;
+
+        let filter = format!(
+            "file_path = '{}'",
+            escape_filter_string(file_path)
+        );
+        debug!(
+            "delete_by_file_path: deleting chunks with filter: {}",
+            filter
+        );
+        table
+            .delete(&filter)
+            .await
+            .with_context(|| format!("Failed to delete vectors for file_path={file_path}"))?;
+        debug!("delete_by_file_path: deletion completed");
+
+        Ok(())
+    }
+
+    /// Count rows for a given stored `file_path` (exact match).
+    /// Used by durability tests; handy for debugging index integrity.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub async fn count_by_file_path(&self, file_path: &str) -> Result<usize> {
+        let table_names = self.connection.table_names().execute().await?;
+        if !table_names.contains(&self.table_name) {
+            return Ok(0);
+        }
+
+        let table = self
+            .connection
+            .open_table(&self.table_name)
+            .execute()
+            .await?;
+
+        let filter = format!(
+            "file_path = '{}'",
+            escape_filter_string(file_path)
+        );
+        let count = table.count_rows(Some(filter)).await?;
+        Ok(count)
     }
 
     pub async fn search(
@@ -300,5 +359,119 @@ impl VectorDB {
         }
 
         Ok(points)
+    }
+}
+
+/// Escape a string for use inside a single-quoted LanceDB filter literal.
+fn escape_filter_string(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::path::PathBuf;
+
+    fn temp_db_path() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("msrch_db_test_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("index.db")
+    }
+
+    fn point(id: Uuid, file_path: &str, content: &str, dim: usize) -> (Uuid, Vec<f32>, serde_json::Value) {
+        let vector = vec![1.0_f32; dim];
+        let payload = json!({
+            "file_path": file_path,
+            "content": content,
+            "chunk_index": 0u64,
+            "context": "",
+        });
+        (id, vector, payload)
+    }
+
+    #[tokio::test]
+    async fn delete_by_file_path_removes_only_that_file() {
+        let path = temp_db_path();
+        let db = VectorDB::new(path.clone()).await.unwrap();
+        db.init_collection(4).await.unwrap();
+
+        let a1 = Uuid::new_v4();
+        let a2 = Uuid::new_v4();
+        let b1 = Uuid::new_v4();
+        db.upsert_chunks(vec![
+            point(a1, "/proj/a.rs", "fn a1", 4),
+            point(a2, "/proj/a.rs", "fn a2", 4),
+            point(b1, "/proj/b.rs", "fn b1", 4),
+        ])
+        .await
+        .unwrap();
+
+        assert_eq!(db.count().await.unwrap(), 3);
+
+        db.delete_by_file_path("/proj/a.rs").await.unwrap();
+
+        assert_eq!(db.count().await.unwrap(), 1);
+        assert_eq!(db.count_by_file_path("/proj/a.rs").await.unwrap(), 0);
+        assert_eq!(db.count_by_file_path("/proj/b.rs").await.unwrap(), 1);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_by_file_path_clears_orphans_then_readd_is_exact() {
+        // Simulates a partial failed run that left orphan rows, then a clean re-index.
+        let path = temp_db_path();
+        let db = VectorDB::new(path.clone()).await.unwrap();
+        db.init_collection(4).await.unwrap();
+
+        let orphan = Uuid::new_v4();
+        db.upsert_chunks(vec![point(orphan, "/proj/a.rs", "orphan", 4)])
+            .await
+            .unwrap();
+
+        db.delete_by_file_path("/proj/a.rs").await.unwrap();
+        let fresh = Uuid::new_v4();
+        db.upsert_chunks(vec![point(fresh, "/proj/a.rs", "fresh", 4)])
+            .await
+            .unwrap();
+
+        assert_eq!(db.count_by_file_path("/proj/a.rs").await.unwrap(), 1);
+        assert_eq!(db.count().await.unwrap(), 1);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_by_file_path_escapes_single_quotes() {
+        let path = temp_db_path();
+        let db = VectorDB::new(path.clone()).await.unwrap();
+        db.init_collection(4).await.unwrap();
+
+        let tricky = "/proj/it's_fine.rs";
+        let id = Uuid::new_v4();
+        db.upsert_chunks(vec![point(id, tricky, "content", 4)])
+            .await
+            .unwrap();
+
+        db.delete_by_file_path(tricky).await.unwrap();
+        assert_eq!(db.count().await.unwrap(), 0);
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[tokio::test]
+    async fn delete_by_file_path_missing_table_is_ok() {
+        let path = temp_db_path();
+        let db = VectorDB::new(path.clone()).await.unwrap();
+        // No init_collection — table does not exist.
+        db.delete_by_file_path("/anything.rs").await.unwrap();
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn escape_filter_string_doubles_single_quotes() {
+        assert_eq!(escape_filter_string("a'b"), "a''b");
+        assert_eq!(escape_filter_string("plain"), "plain");
     }
 }

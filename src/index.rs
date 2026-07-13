@@ -1,8 +1,8 @@
-use crate::chunker::Chunker;
+use crate::chunker::{Chunk, Chunker};
 use crate::config::Config;
 use crate::crawler::Crawler;
 use crate::db::VectorDB;
-use crate::embedding::EmbeddingClient;
+use crate::embedding::{Embedder, EmbeddingClient};
 use anyhow::{Context, Result};
 use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -12,7 +12,6 @@ use serde_json::json;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 use std::time::SystemTime;
 
 /// Bump this whenever the on-disk vector schema OR chunk content/embedding
@@ -165,6 +164,41 @@ pub struct Indexer {
     root_path: PathBuf,
 }
 
+/// Stable string form used for the `file_path` column and delete filters.
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
+/// Write `manifest.json` via temp file + rename so readers never see a partial file.
+fn atomic_write_manifest(path: &Path, manifest: &Manifest) -> Result<()> {
+    let tmp = path.with_extension("json.tmp");
+    {
+        let mut file = fs::File::create(&tmp)
+            .with_context(|| format!("Failed to create temporary manifest {}", tmp.display()))?;
+        serde_json::to_writer_pretty(&mut file, manifest)
+            .context("Failed to serialize manifest")?;
+        file.sync_all().context("Failed to fsync temporary manifest")?;
+    }
+    fs::rename(&tmp, path).with_context(|| {
+        format!(
+            "Failed to replace manifest {} with {}",
+            path.display(),
+            tmp.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn load_manifest(path: &Path) -> Result<Manifest> {
+    if !path.exists() {
+        return Ok(Manifest::default());
+    }
+    let file = fs::File::open(path)
+        .with_context(|| format!("Failed to open manifest {}", path.display()))?;
+    let manifest = serde_json::from_reader(file).unwrap_or_default();
+    Ok(manifest)
+}
+
 impl Indexer {
     pub fn new(root_path: PathBuf, config: Config) -> Self {
         Self { root_path, config }
@@ -193,165 +227,205 @@ impl Indexer {
     }
 
     pub async fn index(&self) -> Result<()> {
-        let msrch_dir = self.root_path.join(".msrch");
-        fs::create_dir_all(&msrch_dir).context("Failed to create .msrch dir")?;
-
-        let crawler = Crawler::new(self.config.indexing.clone()); // TODO: pass actual config
-        let mut chunker = Chunker::new(self.config.chunking.clone());
         let embedder = EmbeddingClient::new(self.config.embedding.clone())?;
         println!(
             "Using embedding endpoint: {}",
             self.config.embedding.endpoint
         );
+        self.index_with_embedder(&embedder).await
+    }
+
+    /// Index using an arbitrary [`Embedder`]. Used by production and tests.
+    pub async fn index_with_embedder<E: Embedder>(&self, embedder: &E) -> Result<()> {
+        let msrch_dir = self.root_path.join(".msrch");
+        fs::create_dir_all(&msrch_dir).context("Failed to create .msrch dir")?;
+
+        let crawler = Crawler::new(self.config.indexing.clone());
+        let mut chunker = Chunker::new(self.config.chunking.clone());
 
         let manifest_path = msrch_dir.join("manifest.json");
         let db_path = msrch_dir.join("index.db");
-        let mut manifest: Manifest = if manifest_path.exists() {
-            let file = fs::File::open(&manifest_path)?;
-            serde_json::from_reader(file).unwrap_or_default()
-        } else {
-            Manifest::default()
-        };
+        let mut prior_manifest = load_manifest(&manifest_path)?;
 
         // Rebuild from scratch if the on-disk schema predates the current version.
-        if Self::migrate_if_needed(&db_path, &mut manifest)? {
+        if Self::migrate_if_needed(&db_path, &mut prior_manifest)? {
             println!(
                 "Index schema is outdated; rebuilding from scratch (schema v{}).",
                 SCHEMA_VERSION
             );
+            // Persist the wiped state so a crash mid-rebuild doesn't leave a
+            // version-0 manifest pointing at a missing/partial DB.
+            atomic_write_manifest(&manifest_path, &prior_manifest)?;
         }
 
         // Connect after any migration so the table is created with the current schema.
         let db = VectorDB::new(db_path).await?;
-        // Collection will be initialized on first embedding (to detect dimension)
 
         println!("Scanning files...");
         let files = crawler.crawl(&self.root_path)?;
         println!("Found {} files.", files.len());
 
-        let pb = ProgressBar::new(files.len() as u64);
-        pb.set_style(ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
-            .unwrap()
-            .progress_chars("#>-"));
+        let file_set: std::collections::HashSet<PathBuf> = files.iter().cloned().collect();
 
-        let mut chunks_to_embed = Vec::new();
-        let mut new_manifest_entries = HashMap::new();
+        // Working manifest is rebuilt intentionally; only fully committed files land here.
+        let mut working = Manifest {
+            version: SCHEMA_VERSION,
+            files: HashMap::new(),
+        };
 
-        for file_path in files {
+        // 1) Unchanged files: keep prior entry, no DB touch.
+        for path in &files {
+            let modified = fs::metadata(path)
+                .with_context(|| format!("Failed to stat {}", path.display()))?
+                .modified()
+                .with_context(|| format!("Failed to read mtime for {}", path.display()))?;
+            if let Some(meta) = prior_manifest.files.get(path) {
+                if meta.modified_at == modified {
+                    working.files.insert(path.clone(), meta.clone());
+                }
+            }
+        }
+
+        // 2) Deleted files: remove vectors, then drop from store of record.
+        let deleted: Vec<PathBuf> = prior_manifest
+            .files
+            .keys()
+            .filter(|p| !file_set.contains(*p))
+            .cloned()
+            .collect();
+
+        if !deleted.is_empty() {
+            println!("Cleaning up {} deleted files...", deleted.len());
+            for path in &deleted {
+                let key = path_key(path);
+                debug!("Deleting vectors for removed file: {}", key);
+                db.delete_by_file_path(&key).await.with_context(|| {
+                    format!(
+                        "Failed to delete vectors for removed file {}",
+                        path.display()
+                    )
+                })?;
+            }
+        }
+
+        // Persist after deletes + unchanged copy so a later dirty-file failure
+        // still leaves removed files gone and unchanged files recorded.
+        atomic_write_manifest(&manifest_path, &working)?;
+
+        let dirty: Vec<PathBuf> = files
+            .iter()
+            .filter(|p| !working.files.contains_key(*p))
+            .cloned()
+            .collect();
+
+        if dirty.is_empty() {
+            println!("No new files to index.");
+            return Ok(());
+        }
+
+        println!("Indexing {} changed/new file(s)...", dirty.len());
+        let pb = ProgressBar::new(dirty.len() as u64);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+                .unwrap()
+                .progress_chars("#>-"),
+        );
+
+        let mut collection_initialized = false;
+        let mut embedded_files = 0usize;
+
+        for path in dirty {
             pb.set_message(format!(
-                "Processing {:?}",
-                file_path.file_name().unwrap_or_default()
+                "{}",
+                path.file_name().unwrap_or_default().to_string_lossy()
             ));
 
-            let metadata = fs::metadata(&file_path)?;
-            let modified = metadata.modified()?;
+            let modified = fs::metadata(&path)
+                .with_context(|| format!("Failed to stat {}", path.display()))?
+                .modified()
+                .with_context(|| format!("Failed to read mtime for {}", path.display()))?;
 
-            // Check if needs reindexing
-            if let Some(existing_meta) = manifest.files.get(&file_path) {
-                if existing_meta.modified_at == modified {
-                    new_manifest_entries.insert(file_path.clone(), existing_meta.clone());
+            let content = match fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    // Keep prior index entry so flaky permissions don't wipe vectors.
+                    if let Some(prev) = prior_manifest.files.get(&path) {
+                        warn!(
+                            "Skipping unreadable {}: {} (keeping previous index entry)",
+                            path.display(),
+                            e
+                        );
+                        working.files.insert(path.clone(), prev.clone());
+                        atomic_write_manifest(&manifest_path, &working)?;
+                    } else {
+                        warn!("Skipping unreadable new file {}: {}", path.display(), e);
+                    }
                     pb.inc(1);
                     continue;
                 }
-                // Delete old chunks from DB before reindexing
-                if !existing_meta.chunk_ids.is_empty() {
-                    debug!(
-                        "Deleting {} stale chunks for modified file: {:?}",
-                        existing_meta.chunk_ids.len(),
-                        file_path
-                    );
-                    if let Err(e) = db.delete_by_ids(&existing_meta.chunk_ids).await {
-                        warn!("Failed to delete stale chunks for {:?}: {}", file_path, e);
-                    }
-                }
-            }
-
-            let content = match fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(_) => {
-                    pb.inc(1);
-                    continue; // Skip non-utf8 for now
-                }
             };
 
-            let file_chunks = chunker.chunk_file(&file_path, &content)?;
-            let chunk_ids: Vec<uuid::Uuid> = file_chunks.iter().map(|c| c.id).collect();
+            let chunks = chunker.chunk_file(&path, &content)?;
+            let key = path_key(&path);
 
-            new_manifest_entries.insert(
-                file_path.clone(),
+            // Clear prior vectors + any orphans from a partial prior run.
+            db.delete_by_file_path(&key).await.with_context(|| {
+                format!("Failed to delete stale vectors for {}", path.display())
+            })?;
+
+            if !chunks.is_empty() {
+                self.embed_and_store_chunks(
+                    &db,
+                    embedder,
+                    &chunks,
+                    &mut collection_initialized,
+                )
+                .await
+                .with_context(|| format!("Failed to embed/store {}", path.display()))?;
+            }
+
+            let chunk_ids: Vec<uuid::Uuid> = chunks.iter().map(|c| c.id).collect();
+            working.files.insert(
+                path.clone(),
                 FileMetadata {
                     modified_at: modified,
                     chunk_ids,
                 },
             );
-
-            chunks_to_embed.extend(file_chunks);
+            // Commit unit: this file is fully in the DB before its manifest entry is durable.
+            atomic_write_manifest(&manifest_path, &working)?;
+            embedded_files += 1;
             pb.inc(1);
         }
-        pb.finish_with_message("Done processing files.");
 
-        // Handle deleted files: remove chunks for files that no longer exist
-        let deleted_files: Vec<_> = manifest
-            .files
-            .keys()
-            .filter(|path| !new_manifest_entries.contains_key(*path))
-            .cloned()
-            .collect();
+        pb.finish_with_message("Done.");
+        info!("Committed {} file(s) to the index", embedded_files);
+        Ok(())
+    }
 
-        if !deleted_files.is_empty() {
-            println!("Cleaning up {} deleted files...", deleted_files.len());
-            for deleted_path in &deleted_files {
-                if let Some(meta) = manifest.files.get(deleted_path) {
-                    if !meta.chunk_ids.is_empty() {
-                        debug!(
-                            "Deleting {} chunks for removed file: {:?}",
-                            meta.chunk_ids.len(),
-                            deleted_path
-                        );
-                        if let Err(e) = db.delete_by_ids(&meta.chunk_ids).await {
-                            warn!(
-                                "Failed to delete chunks for deleted file {:?}: {}",
-                                deleted_path, e
-                            );
-                        }
-                    }
-                }
-            }
-        }
+    /// Embed and append all chunks for one file (may use multiple API batches).
+    /// Caller must already have deleted any prior rows for this file's path.
+    async fn embed_and_store_chunks<E: Embedder>(
+        &self,
+        db: &VectorDB,
+        embedder: &E,
+        chunks: &[Chunk],
+        collection_initialized: &mut bool,
+    ) -> Result<()> {
+        let batch_size = self.config.embedding.batch_size.max(1);
+        let total_batches = (chunks.len() + batch_size - 1) / batch_size;
 
-        if chunks_to_embed.is_empty() {
-            // Still save manifest to reflect deleted files
-            manifest.files = new_manifest_entries;
-            let file = fs::File::create(&manifest_path)?;
-            serde_json::to_writer_pretty(file, &manifest)?;
-            println!("No new files to index.");
-            return Ok(());
-        }
-
-        println!("Embedding {} chunks...", chunks_to_embed.len());
-
-        // Batch embedding
-        let batch_size = self.config.embedding.batch_size;
-        let total_batches = (chunks_to_embed.len() + batch_size - 1) / batch_size;
-        info!(
-            "Starting batch embedding: {} batches of size {}",
-            total_batches, batch_size
-        );
-
-        let mut collection_initialized = false;
-
-        for (batch_num, batch) in chunks_to_embed.chunks(batch_size).enumerate() {
+        for (batch_num, batch) in chunks.chunks(batch_size).enumerate() {
             debug!(
-                "Processing batch {}/{} ({} chunks)",
+                "Embedding batch {}/{} ({} chunks)",
                 batch_num + 1,
                 total_batches,
                 batch.len()
             );
 
-            // Embed the semantic context path (e.g. "impl::Foo::fn::bar") alongside the
-            // content so symbol/scope names influence the vector. The raw content is still
-            // what gets stored and displayed.
+            // Embed the semantic context path alongside content so symbol names
+            // influence the vector. Stored/displayed content remains the raw text.
             let texts: Vec<String> = batch
                 .iter()
                 .map(|c| match &c.context {
@@ -359,76 +433,46 @@ impl Indexer {
                     _ => c.content.clone(),
                 })
                 .collect();
-            debug!("Extracted {} texts from batch", texts.len());
 
-            let start = Instant::now();
-            match embedder.embed(texts).await {
-                Ok(embeddings) => {
-                    let duration = start.elapsed();
-                    debug!(
-                        "Embedding batch {}/{} completed in {:?}",
-                        batch_num + 1,
-                        total_batches,
-                        duration
-                    );
-                    debug!("Got {} embeddings", embeddings.len());
+            let embeddings = embedder.embed(texts).await.map_err(|e| {
+                error!(
+                    "Failed to embed batch {}/{}: {:?}",
+                    batch_num + 1,
+                    total_batches,
+                    e
+                );
+                e
+            })?;
 
-                    // Initialize collection on first batch using actual embedding dimension
-                    if !collection_initialized {
-                        if let Some(first_emb) = embeddings.first() {
-                            let dim = first_emb.len();
-                            info!("Detected embedding dimension: {}", dim);
-                            db.init_collection(dim).await?;
-                            collection_initialized = true;
-                        }
-                    }
-
-                    let mut points = Vec::new();
-                    for (chunk, embedding) in batch.iter().zip(embeddings) {
-                        let payload = json!({
-                            "file_path": chunk.file_path,
-                            "content": chunk.content,
-                            "chunk_index": chunk.chunk_index,
-                            "context": chunk.context.clone().unwrap_or_default(),
-                        });
-                        points.push((chunk.id, embedding, payload));
-                    }
-                    debug!("Prepared {} points for upsert", points.len());
-
-                    match db.upsert_chunks(points).await {
-                        Ok(_) => debug!(
-                            "Batch {}/{} upserted successfully",
-                            batch_num + 1,
-                            total_batches
-                        ),
-                        Err(e) => {
-                            error!(
-                                "Failed to upsert batch {}/{}: {:?}",
-                                batch_num + 1,
-                                total_batches,
-                                e
-                            );
-                            return Err(e.context(format!("Batch {} upsert failed", batch_num + 1)));
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!(
-                        "Failed to embed batch {}/{}: {:?}",
-                        batch_num + 1,
-                        total_batches,
-                        e
-                    );
-                    eprintln!("Failed to embed batch {}: {}", batch_num + 1, e);
-                    return Err(e);
+            if !*collection_initialized {
+                if let Some(first_emb) = embeddings.first() {
+                    let dim = first_emb.len();
+                    info!("Detected embedding dimension: {}", dim);
+                    db.init_collection(dim).await?;
+                    *collection_initialized = true;
                 }
             }
-        }
-        info!("All {} batches processed successfully", total_batches);
 
-        manifest.files = new_manifest_entries;
-        let file = fs::File::create(&manifest_path)?;
-        serde_json::to_writer_pretty(file, &manifest)?;
+            let mut points = Vec::with_capacity(batch.len());
+            for (chunk, embedding) in batch.iter().zip(embeddings) {
+                let payload = json!({
+                    "file_path": path_key(&chunk.file_path),
+                    "content": chunk.content,
+                    "chunk_index": chunk.chunk_index,
+                    "context": chunk.context.clone().unwrap_or_default(),
+                });
+                points.push((chunk.id, embedding, payload));
+            }
+
+            db.upsert_chunks(points).await.with_context(|| {
+                format!("Batch {} upsert failed", batch_num + 1)
+            })?;
+            debug!(
+                "Batch {}/{} upserted successfully",
+                batch_num + 1,
+                total_batches
+            );
+        }
 
         Ok(())
     }
@@ -437,6 +481,8 @@ impl Indexer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::FakeEmbedder;
+    use std::time::Duration;
 
     fn temp_dir() -> PathBuf {
         // uuid is already a dependency; use it to avoid parallel-test collisions.
@@ -448,6 +494,25 @@ mod tests {
     fn seed_index(db_path: &Path, marker: &[u8]) {
         fs::create_dir_all(db_path).unwrap();
         fs::write(db_path.join("data.lance"), marker).unwrap();
+    }
+
+    fn test_config() -> Config {
+        let mut config = Config::default();
+        config.embedding.batch_size = 32;
+        config.chunking.use_treesitter = false;
+        config.chunking.max_chunk_tokens = 512;
+        config
+    }
+
+    fn write_file(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    fn load_test_manifest(root: &Path) -> Manifest {
+        load_manifest(&root.join(".msrch/manifest.json")).unwrap()
     }
 
     #[test]
@@ -535,5 +600,265 @@ mod tests {
             manifest.version, 0,
             "a missing version must read as 0 so migration is triggered"
         );
+    }
+
+    #[test]
+    fn atomic_write_manifest_round_trips() {
+        let dir = temp_dir();
+        let path = dir.join("manifest.json");
+        let mut manifest = Manifest {
+            version: SCHEMA_VERSION,
+            files: HashMap::new(),
+        };
+        let id = uuid::Uuid::new_v4();
+        manifest.files.insert(
+            PathBuf::from("a.rs"),
+            FileMetadata {
+                modified_at: SystemTime::UNIX_EPOCH,
+                chunk_ids: vec![id],
+            },
+        );
+
+        atomic_write_manifest(&path, &manifest).unwrap();
+        assert!(path.exists());
+        assert!(!path.with_extension("json.tmp").exists());
+
+        let loaded = load_manifest(&path).unwrap();
+        assert_eq!(loaded.version, SCHEMA_VERSION);
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(loaded.files[&PathBuf::from("a.rs")].chunk_ids, vec![id]);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn indexes_two_files_and_records_manifest() {
+        let root = temp_dir();
+        write_file(&root.join("a.txt"), "alpha content for indexing");
+        write_file(&root.join("b.txt"), "beta content for indexing");
+
+        let indexer = Indexer::new(root.clone(), test_config());
+        let embedder = FakeEmbedder::new(8);
+        indexer.index_with_embedder(&embedder).await.unwrap();
+
+        let manifest = load_test_manifest(&root);
+        assert_eq!(manifest.version, SCHEMA_VERSION);
+        assert_eq!(manifest.files.len(), 2);
+
+        let db = VectorDB::new(root.join(".msrch/index.db")).await.unwrap();
+        assert_eq!(db.count().await.unwrap(), 2);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn reindex_file_replaces_vectors_without_duplicates() {
+        let root = temp_dir();
+        let file = root.join("doc.txt");
+        write_file(&file, "version one of the document text");
+
+        let indexer = Indexer::new(root.clone(), test_config());
+        indexer
+            .index_with_embedder(&FakeEmbedder::new(8))
+            .await
+            .unwrap();
+
+        let db = VectorDB::new(root.join(".msrch/index.db")).await.unwrap();
+        let count_after_first = db.count().await.unwrap();
+        assert!(count_after_first >= 1);
+
+        // Ensure mtime advances on filesystems with coarse timestamps.
+        std::thread::sleep(Duration::from_millis(20));
+        write_file(&file, "version two of the document text which is different");
+
+        indexer
+            .index_with_embedder(&FakeEmbedder::new(8))
+            .await
+            .unwrap();
+
+        // Reconnect so we observe commits from the second indexer connection.
+        let db = VectorDB::new(root.join(".msrch/index.db")).await.unwrap();
+        let count_after_second = db.count().await.unwrap();
+        assert_eq!(
+            count_after_second, count_after_first,
+            "re-index must replace vectors, not append duplicates"
+        );
+
+        let key = path_key(&file);
+        assert_eq!(db.count_by_file_path(&key).await.unwrap(), count_after_first);
+
+        let manifest = load_test_manifest(&root);
+        assert_eq!(manifest.files.len(), 1);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn failed_embed_keeps_prior_committed_files() {
+        let root = temp_dir();
+        // Distinct names so crawl order is deterministic enough; we still
+        // only require that *some* file is committed before the failure.
+        write_file(&root.join("1_first.txt"), "first file body");
+        write_file(&root.join("2_second.txt"), "second file body");
+
+        let indexer = Indexer::new(root.clone(), test_config());
+        // Fail on the second embed call (second dirty file).
+        let embedder = FakeEmbedder::fail_at(8, 1);
+        let err = indexer.index_with_embedder(&embedder).await;
+        assert!(err.is_err(), "second embed should fail the run");
+
+        let manifest = load_test_manifest(&root);
+        assert_eq!(
+            manifest.files.len(),
+            1,
+            "only the first successfully committed file should be in the manifest"
+        );
+
+        let db = VectorDB::new(root.join(".msrch/index.db")).await.unwrap();
+        assert_eq!(db.count().await.unwrap(), 1);
+
+        // Recovery: full re-run succeeds and indexes both.
+        indexer
+            .index_with_embedder(&FakeEmbedder::new(8))
+            .await
+            .unwrap();
+        let manifest = load_test_manifest(&root);
+        assert_eq!(manifest.files.len(), 2);
+        let db = VectorDB::new(root.join(".msrch/index.db")).await.unwrap();
+        assert_eq!(db.count().await.unwrap(), 2);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn orphan_rows_cleaned_on_reindex() {
+        let root = temp_dir();
+        let file = root.join("solo.txt");
+        write_file(&file, "solo document content");
+
+        let indexer = Indexer::new(root.clone(), test_config());
+        indexer
+            .index_with_embedder(&FakeEmbedder::new(8))
+            .await
+            .unwrap();
+
+        let db = VectorDB::new(root.join(".msrch/index.db")).await.unwrap();
+        let key = path_key(&file);
+
+        // Simulate a partial failure: orphan row with unknown id for same path.
+        let orphan_id = uuid::Uuid::new_v4();
+        db.upsert_chunks(vec![(
+            orphan_id,
+            vec![0.5_f32; 8],
+            json!({
+                "file_path": key,
+                "content": "orphan",
+                "chunk_index": 99u64,
+                "context": "",
+            }),
+        )])
+        .await
+        .unwrap();
+        assert_eq!(db.count_by_file_path(&key).await.unwrap(), 2);
+
+        std::thread::sleep(Duration::from_millis(20));
+        write_file(&file, "solo document content updated");
+
+        indexer
+            .index_with_embedder(&FakeEmbedder::new(8))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            db.count_by_file_path(&key).await.unwrap(),
+            1,
+            "path-delete before re-add must clear orphans"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn deleted_file_removes_vectors_and_manifest_entry() {
+        let root = temp_dir();
+        let keep = root.join("keep.txt");
+        let drop = root.join("drop.txt");
+        write_file(&keep, "keep me around");
+        write_file(&drop, "delete me later");
+
+        let indexer = Indexer::new(root.clone(), test_config());
+        indexer
+            .index_with_embedder(&FakeEmbedder::new(8))
+            .await
+            .unwrap();
+
+        let db = VectorDB::new(root.join(".msrch/index.db")).await.unwrap();
+        assert_eq!(db.count().await.unwrap(), 2);
+
+        fs::remove_file(&drop).unwrap();
+        indexer
+            .index_with_embedder(&FakeEmbedder::new(8))
+            .await
+            .unwrap();
+
+        assert_eq!(db.count().await.unwrap(), 1);
+        assert_eq!(db.count_by_file_path(&path_key(&drop)).await.unwrap(), 0);
+        assert_eq!(db.count_by_file_path(&path_key(&keep)).await.unwrap(), 1);
+
+        let manifest = load_test_manifest(&root);
+        assert_eq!(manifest.files.len(), 1);
+        assert!(manifest.files.contains_key(&keep));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn unreadable_previously_indexed_file_keeps_entry() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = temp_dir();
+        let file = root.join("locked.txt");
+        write_file(&file, "initially readable content");
+
+        let indexer = Indexer::new(root.clone(), test_config());
+        indexer
+            .index_with_embedder(&FakeEmbedder::new(8))
+            .await
+            .unwrap();
+
+        let prior = load_test_manifest(&root);
+        let prior_meta = prior.files.get(&file).cloned().expect("file was indexed");
+        let prior_count = {
+            let db = VectorDB::new(root.join(".msrch/index.db")).await.unwrap();
+            db.count().await.unwrap()
+        };
+
+        // Bump mtime then remove all permissions so the path is dirty but unreadable.
+        std::thread::sleep(Duration::from_millis(20));
+        write_file(&file, "changed but will be locked");
+        let mut perms = fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o000);
+        fs::set_permissions(&file, perms).unwrap();
+
+        indexer
+            .index_with_embedder(&FakeEmbedder::new(8))
+            .await
+            .unwrap();
+
+        // Restore perms for cleanup/assertions.
+        let mut perms = fs::metadata(&file).unwrap().permissions();
+        perms.set_mode(0o644);
+        fs::set_permissions(&file, perms).unwrap();
+
+        let after = load_test_manifest(&root);
+        let after_meta = after.files.get(&file).expect("entry must be retained");
+        // Kept the previous chunk ids (could not re-read to re-embed).
+        assert_eq!(after_meta.chunk_ids, prior_meta.chunk_ids);
+
+        let db = VectorDB::new(root.join(".msrch/index.db")).await.unwrap();
+        assert_eq!(db.count().await.unwrap(), prior_count);
+
+        fs::remove_dir_all(&root).ok();
     }
 }
