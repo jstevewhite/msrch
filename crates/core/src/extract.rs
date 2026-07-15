@@ -101,8 +101,145 @@ fn readability_markdown(raw: &str) -> Option<(String, String)> {
 fn extract_pdf(_path: &Path) -> Result<Option<String>> {
     anyhow::bail!("extract_pdf: implemented in Task 4")
 }
-fn extract_docx(_path: &Path) -> Result<Option<String>> {
-    anyhow::bail!("extract_docx: implemented in Task 3")
+fn extract_docx(path: &Path) -> Result<Option<String>> {
+    let file = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) => return Err(e).context("open docx"),
+    };
+    let mut archive = match zip::ZipArchive::new(file) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("warning: skipping {}: not a readable docx archive: {e}", path.display());
+            return Ok(None);
+        }
+    };
+    let mut xml = String::new();
+    match archive.by_name("word/document.xml") {
+        Ok(mut entry) => {
+            use std::io::Read;
+            if let Err(e) = entry.read_to_string(&mut xml) {
+                eprintln!("warning: skipping {}: unreadable document.xml: {e}", path.display());
+                return Ok(None);
+            }
+        }
+        Err(_) => {
+            eprintln!("warning: skipping {}: no word/document.xml", path.display());
+            return Ok(None);
+        }
+    }
+
+    let text = docx_xml_to_markdown(&xml);
+    if text.trim().is_empty() {
+        eprintln!("warning: skipping {}: no extractable text", path.display());
+        return Ok(None);
+    }
+    Ok(Some(text))
+}
+
+/// Map a paragraph style name to a markdown heading level (0 = not a heading).
+fn heading_from_style(style: &str) -> usize {
+    let s = style.trim();
+    if s.eq_ignore_ascii_case("title") {
+        return 1;
+    }
+    let rest = s
+        .strip_prefix("Heading")
+        .or_else(|| s.strip_prefix("heading"))
+        .map(str::trim)
+        .unwrap_or("");
+    rest.parse::<usize>().ok().filter(|n| (1..=6).contains(n)).unwrap_or(0)
+}
+
+/// Stream word/document.xml into markdown-ish text: Heading styles → `#`,
+/// runs concatenated, tabs → space, table rows → `cell | cell` lines.
+fn docx_xml_to_markdown(xml: &str) -> String {
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(xml);
+    let mut out = String::new();
+    let mut para = String::new();
+    let mut heading = 0usize;
+    let mut in_text = false;
+    let mut in_row = false;
+    let mut row = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"p" if !in_row => {
+                    para.clear();
+                    heading = 0;
+                }
+                b"t" => in_text = true,
+                b"tr" => {
+                    in_row = true;
+                    row.clear();
+                    para.clear();
+                }
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => match e.local_name().as_ref() {
+                b"pStyle" => {
+                    if let Ok(Some(attr)) = e.try_get_attribute("w:val") {
+                        heading = heading_from_style(&String::from_utf8_lossy(&attr.value));
+                    }
+                }
+                b"tab" => para.push(' '),
+                b"br" => para.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Text(t)) if in_text => {
+                // quick-xml 0.41 dropped `BytesText::unescape()`; `decode()`
+                // only resolves byte encoding, not XML entities like
+                // `&amp;`, so entity-unescaping is a separate explicit step
+                // via the free function `quick_xml::escape::unescape`.
+                if let Ok(decoded) = t.decode() {
+                    match quick_xml::escape::unescape(&decoded) {
+                        Ok(s) => para.push_str(&s),
+                        Err(_) => para.push_str(&decoded),
+                    }
+                }
+            }
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"t" => in_text = false,
+                b"p" if !in_row => {
+                    let trimmed = para.trim();
+                    if !trimmed.is_empty() {
+                        if heading > 0 {
+                            out.push_str(&"#".repeat(heading));
+                            out.push(' ');
+                        }
+                        out.push_str(trimmed);
+                        out.push_str("\n\n");
+                    }
+                }
+                b"tc" => {
+                    let cell = para.trim();
+                    if !row.is_empty() {
+                        row.push_str(" | ");
+                    }
+                    row.push_str(cell);
+                    para.clear();
+                }
+                b"tr" => {
+                    in_row = false;
+                    if !row.trim().is_empty() {
+                        out.push_str(row.trim());
+                        out.push('\n');
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                log::debug!("docx xml parse stopped early: {e}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    out.trim().to_string()
 }
 
 /// Convert an HTML string to markdown-ish plain text: h1–h6 → `#` lines,
@@ -330,6 +467,72 @@ mod tests {
         assert!(md.contains("See the link."), "no space before period: {md}");
         assert!(md.contains("wordglued"), "source had no space — none fabricated: {md}");
         assert!(md.contains("glued and a b"), "whitespace-only text nodes still separate: {md}");
+    }
+
+    /// Build a minimal .docx (zip with word/document.xml) in memory.
+    fn build_docx(document_xml: &str) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let cursor = std::io::Cursor::new(&mut buf);
+            let mut z = zip::ZipWriter::new(cursor);
+            let opts = zip::write::SimpleFileOptions::default();
+            z.start_file("word/document.xml", opts).unwrap();
+            z.write_all(document_xml.as_bytes()).unwrap();
+            z.finish().unwrap();
+        }
+        buf
+    }
+
+    fn write_docx(dir: &tempfile::TempDir, name: &str, document_xml: &str) -> PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, build_docx(document_xml)).unwrap();
+        p
+    }
+
+    const DOCX_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+ <w:body>
+  <w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Report Title</w:t></w:r></w:p>
+  <w:p><w:r><w:t>First part,</w:t></w:r><w:r><w:t xml:space="preserve"> second part.</w:t></w:r></w:p>
+  <w:p><w:pPr><w:pStyle w:val="Heading2"/></w:pPr><w:r><w:t>Details</w:t></w:r></w:p>
+  <w:p><w:r><w:t>Before tab</w:t><w:tab/><w:t>after tab.</w:t></w:r></w:p>
+  <w:tbl>
+   <w:tr><w:tc><w:p><w:r><w:t>Metric</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Value</w:t></w:r></w:p></w:tc></w:tr>
+   <w:tr><w:tc><w:p><w:r><w:t>Files</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>24</w:t></w:r></w:p></w:tc></w:tr>
+  </w:tbl>
+ </w:body>
+</w:document>"#;
+
+    #[test]
+    fn docx_headings_runs_tabs_and_tables_extract() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_docx(&dir, "report.docx", DOCX_BODY);
+        let text = extract(&p, u64::MAX).unwrap().expect("docx must extract");
+        assert!(text.contains("# Report Title"), "Heading1 → #: {text}");
+        assert!(text.contains("## Details"), "Heading2 → ##: {text}");
+        assert!(text.contains("First part, second part."), "runs concatenated: {text}");
+        assert!(text.contains("Before tab after tab."), "tab → space: {text}");
+        assert!(text.contains("Metric | Value"), "table row flattened: {text}");
+        assert!(text.contains("Files | 24"), "second row: {text}");
+    }
+
+    #[test]
+    fn docx_with_no_text_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+ <w:body><w:p></w:p></w:body></w:document>"#;
+        let p = write_docx(&dir, "empty.docx", empty);
+        assert!(extract(&p, u64::MAX).unwrap().is_none(), "empty docx → skip");
+    }
+
+    #[test]
+    fn docx_that_is_not_a_zip_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("corrupt.docx");
+        std::fs::write(&p, b"this is not a zip archive").unwrap();
+        assert!(extract(&p, u64::MAX).unwrap().is_none(), "corrupt docx → skip, not Err");
     }
 
     #[test]
