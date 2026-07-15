@@ -1,15 +1,8 @@
-mod chunker;
-mod config;
-mod crawler;
-mod db;
-mod embedding;
-mod index;
 mod output;
-mod reranker;
-mod search;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
+use msrch_core::{config, index, search};
 use output::OutputFormat;
 use std::path::PathBuf;
 

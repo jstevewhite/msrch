@@ -3959,12 +3959,24 @@ name = "msrch"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arrow",
  "chrono",
  "clap",
  "colored",
- "confy",
  "env_logger",
+ "log",
+ "msrch-core",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "msrch-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "confy",
  "futures",
  "ignore",
  "indicatif",
@@ -3973,6 +3985,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "tempfile",
  "tiktoken-rs",
  "tokio",
  "toml",

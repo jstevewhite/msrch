@@ -1,7 +1,7 @@
-use crate::index::IndexStats;
-use crate::search::{SearchResult, SimilarFile};
 use clap::ValueEnum;
 use colored::*;
+use msrch_core::index::IndexStats;
+use msrch_core::search::{SearchResult, SimilarFile};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
