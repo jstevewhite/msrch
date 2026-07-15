@@ -92,9 +92,9 @@ async fn main() -> anyhow::Result<()> {
                     .filter_level(log::LevelFilter::Debug)
                     .init();
             }
-            let config = config::Config::load_global_config_or_default();
             // Resolve absolute path
             let root_path = std::fs::canonicalize(path).unwrap_or(path.clone());
+            let config = config::Config::load_for_index(&root_path);
             let indexer = index::Indexer::new(root_path, config);
             indexer.index().await.context("Indexing failed")?;
             println!("Indexing completed successfully.");
@@ -118,11 +118,18 @@ async fn main() -> anyhow::Result<()> {
             let current_dir = std::env::current_dir()?;
             let root_path = index::find_index_root(&current_dir)
                 .context("No .msrch index found in directory tree")?;
+            // Load the effective config BEFORE touching .msrch, and remove only
+            // the index artifacts so a project config.toml survives the rebuild.
+            let config = config::Config::load_for_index(&root_path);
             let msrch_dir = root_path.join(".msrch");
-            if msrch_dir.exists() {
-                std::fs::remove_dir_all(&msrch_dir).context("Failed to remove old index")?;
+            let db_path = msrch_dir.join("index.db");
+            if db_path.exists() {
+                std::fs::remove_dir_all(&db_path).context("Failed to remove old index db")?;
             }
-            let config = config::Config::load_global_config_or_default();
+            let manifest_path = msrch_dir.join("manifest.json");
+            if manifest_path.exists() {
+                std::fs::remove_file(&manifest_path).context("Failed to remove old manifest")?;
+            }
             let indexer = index::Indexer::new(root_path, config);
             indexer.index().await.context("Reindexing failed")?;
             println!("Reindexing completed successfully.");
@@ -151,8 +158,17 @@ async fn main() -> anyhow::Result<()> {
             output::print_similar(&results);
         }
         Commands::Config => {
-            let config = config::Config::load_global_config_or_default();
-            println!("{:#?}", config);
+            let current_dir = std::env::current_dir()?;
+            match index::find_index_root(&current_dir) {
+                Some(root) => {
+                    println!("# effective config for index at {}", root.display());
+                    println!("{:#?}", config::Config::load_for_index(&root));
+                }
+                None => {
+                    println!("# global config (no .msrch index found)");
+                    println!("{:#?}", config::Config::load_global_config_or_default());
+                }
+            }
         }
     }
 

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -183,18 +183,182 @@ impl Config {
         }
     }
 
-    pub fn load_from_path(path: PathBuf) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
-        Ok(config)
+    /// Effective config for an index root: the global config overlaid with the
+    /// project's `.msrch/config.toml`, field by field (project wins).
+    /// Precedence overall: CLI flags > project config > global config > defaults;
+    /// the first is applied by callers, the rest by this function.
+    pub fn load_for_index(index_root: &Path) -> Self {
+        let global = Self::load_global_config_or_default();
+        let project_path = index_root.join(".msrch").join("config.toml");
+        Self::overlay_project_config(global, &project_path)
     }
 
-    // Example helper to merge/override configs could go here
+    /// Overlay the config file at `project_path` (if present) onto `base`.
+    /// Missing file is normal (returns base). A malformed file or invalid values
+    /// warn to stderr and return base, mirroring `load_global_config_or_default`.
+    fn overlay_project_config(base: Config, project_path: &Path) -> Config {
+        let text = match std::fs::read_to_string(project_path) {
+            Ok(text) => text,
+            Err(_) => return base,
+        };
+        let overlay: toml::Value = match toml::from_str(&text) {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!(
+                    "warning: failed to parse {}: {e}; using global config",
+                    project_path.display()
+                );
+                return base;
+            }
+        };
+        // Round-trip the base through toml so we can merge at the value level;
+        // this is what lets a project file override single fields without
+        // clobbering whole sections.
+        let base_text = match toml::to_string(&base) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("warning: failed to serialize config for merge: {e}");
+                return base;
+            }
+        };
+        let mut merged: toml::Value = match toml::from_str(&base_text) {
+            Ok(value) => value,
+            Err(e) => {
+                eprintln!("warning: failed to re-parse config for merge: {e}");
+                return base;
+            }
+        };
+        deep_merge(&mut merged, overlay);
+        let merged_text = match toml::to_string(&merged) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("warning: failed to serialize merged config: {e}");
+                return base;
+            }
+        };
+        match toml::from_str(&merged_text) {
+            Ok(config) => config,
+            Err(e) => {
+                eprintln!(
+                    "warning: invalid values in {}: {e}; using global config",
+                    project_path.display()
+                );
+                base
+            }
+        }
+    }
+}
+
+/// Merge `overlay` into `base`: tables merge recursively; every other value
+/// type (including arrays) replaces wholesale.
+fn deep_merge(base: &mut toml::Value, overlay: toml::Value) {
+    match overlay {
+        toml::Value::Table(overlay_map) => {
+            if let toml::Value::Table(base_map) = base {
+                for (key, value) in overlay_map {
+                    match base_map.get_mut(&key) {
+                        Some(existing) => deep_merge(existing, value),
+                        None => {
+                            base_map.insert(key, value);
+                        }
+                    }
+                }
+            } else {
+                *base = toml::Value::Table(overlay_map);
+            }
+        }
+        other => *base = other,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_merge_overlays_nested_tables_field_by_field() {
+        let mut base: toml::Value = toml::from_str(
+            r#"
+[query]
+default_limit = 10
+min_similarity = 0.5
+
+[embedding]
+model = "global-model"
+"#,
+        )
+        .unwrap();
+        let overlay: toml::Value = toml::from_str(
+            r#"
+[query]
+default_limit = 3
+
+[reranker]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        deep_merge(&mut base, overlay);
+
+        // Overlaid field wins:
+        assert_eq!(base["query"]["default_limit"].as_integer(), Some(3));
+        // Sibling field in the same table survives:
+        assert_eq!(base["query"]["min_similarity"].as_float(), Some(0.5));
+        // Untouched table survives:
+        assert_eq!(base["embedding"]["model"].as_str(), Some("global-model"));
+        // Table only in overlay is added:
+        assert_eq!(base["reranker"]["enabled"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn overlay_project_config_missing_file_returns_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = Config::default();
+        let merged =
+            Config::overlay_project_config(base, &dir.path().join(".msrch").join("config.toml"));
+        assert_eq!(merged.query.default_limit, Config::default().query.default_limit);
+        assert_eq!(merged.embedding.model, Config::default().embedding.model);
+    }
+
+    #[test]
+    fn overlay_project_config_partial_file_overrides_only_named_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let msrch_dir = dir.path().join(".msrch");
+        std::fs::create_dir_all(&msrch_dir).unwrap();
+        let config_path = msrch_dir.join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+[query]
+default_limit = 3
+
+[embedding]
+model = "project-model"
+"#,
+        )
+        .unwrap();
+
+        let merged = Config::overlay_project_config(Config::default(), &config_path);
+
+        // Project values win:
+        assert_eq!(merged.query.default_limit, 3);
+        assert_eq!(merged.embedding.model, "project-model");
+        // Everything the project file doesn't name is untouched:
+        assert_eq!(merged.query.min_similarity, Config::default().query.min_similarity);
+        assert_eq!(merged.embedding.endpoint, Config::default().embedding.endpoint);
+        assert_eq!(merged.chunking.max_chunk_tokens, Config::default().chunking.max_chunk_tokens);
+    }
+
+    #[test]
+    fn overlay_project_config_malformed_file_returns_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(&config_path, "this is not [valid toml").unwrap();
+
+        let merged = Config::overlay_project_config(Config::default(), &config_path);
+        assert_eq!(merged.query.default_limit, Config::default().query.default_limit);
+    }
 
     #[test]
     fn config_tolerates_missing_fields_and_sections() {

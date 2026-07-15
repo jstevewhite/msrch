@@ -59,7 +59,8 @@ impl Searcher {
                 .context("No .msrch index found in directory tree")?
         };
 
-        let config = Config::load_global_config_or_default();
+        // Global config overlaid with this index's .msrch/config.toml.
+        let config = Config::load_for_index(&index_root);
 
         Ok(Self { config, index_root })
     }
