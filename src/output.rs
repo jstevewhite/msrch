@@ -1,5 +1,5 @@
 use crate::index::IndexStats;
-use crate::search::SearchResult;
+use crate::search::{SearchResult, SimilarFile};
 use clap::ValueEnum;
 use colored::*;
 use serde::Serialize;
@@ -161,6 +161,25 @@ pub fn print_stats(stats: &IndexStats) {
         format!("{} bytes", stats.size_on_disk)
     };
     println!("  {:<18} {}", "Size on disk:".cyan(), size_str);
+}
+
+/// Print `msrch similar` results (moved from main.rs).
+pub fn print_similar(results: &[SimilarFile]) {
+    if results.is_empty() {
+        println!("No similar files found.");
+    } else {
+        println!(
+            "{}",
+            format!("\nFound {} similar files:", results.len()).bold()
+        );
+        for similar in results {
+            println!(
+                "  {} {}",
+                format!("{:.2}", similar.score).yellow(),
+                similar.file_path.cyan()
+            );
+        }
+    }
 }
 
 #[cfg(test)]

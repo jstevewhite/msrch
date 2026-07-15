@@ -141,99 +141,22 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Similar { file } => {
             use colored::*;
-            use std::collections::HashSet;
 
-            // Resolve file path
             let file_path = std::fs::canonicalize(file).unwrap_or(file.clone());
-
             if !file_path.exists() {
                 anyhow::bail!("File not found: {}", file_path.display());
             }
-
-            // Read file content
-            let content = std::fs::read_to_string(&file_path).context("Failed to read file")?;
-
-            if content.trim().is_empty() {
-                anyhow::bail!("File is empty");
-            }
-
-            // Load config and create embedding client
-            let config = config::Config::load_global_config_or_default();
-            let embedder = embedding::EmbeddingClient::new(config.embedding.clone())?;
-
-            let current_dir = std::env::current_dir()?;
-            let index_root = index::find_index_root(&current_dir)
-                .context("No .msrch index found in directory tree")?;
-
-            let msrch_dir = index_root.join(".msrch");
-            let db = db::VectorDB::new(msrch_dir.join("index.db")).await?;
-
-            // Create embedding for the input file (use truncated content to fit model limits)
-            let truncated = if content.len() > 8000 {
-                content[..8000].to_string()
-            } else {
-                content.clone()
-            };
 
             println!(
                 "Finding files similar to: {}",
                 file_path.display().to_string().cyan()
             );
 
-            let embeddings = match embedder.embed(vec![truncated]).await {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("Failed to embed file: {}", e);
-                    return Ok(());
-                }
-            };
-
-            let query_vector = embeddings.into_iter().next().unwrap();
-
-            // Search for similar chunks
-            let results = db.search(query_vector, 20, 0.0).await?;
-
-            // Deduplicate by file path (show each file only once, with best score)
-            let mut seen_files: HashSet<String> = HashSet::new();
-            let mut unique_results = Vec::new();
-
-            // Exclude the query file itself
-            let query_file_str = file_path.display().to_string();
-
-            for result in results {
-                let result_file = result
-                    .payload
-                    .get("file_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                // Skip the query file
-                if result_file == query_file_str {
-                    continue;
-                }
-
-                if !seen_files.contains(&result_file) {
-                    seen_files.insert(result_file.clone());
-                    unique_results.push((result_file, result.score));
-                }
-
-                if unique_results.len() >= 10 {
-                    break;
-                }
-            }
-
-            if unique_results.is_empty() {
-                println!("No similar files found.");
-            } else {
-                println!(
-                    "{}",
-                    format!("\nFound {} similar files:", unique_results.len()).bold()
-                );
-                for (file, score) in unique_results {
-                    println!("  {} {}", format!("{:.2}", score).yellow(), file.cyan());
-                }
-            }
+            let searcher = search::Searcher::new(None)
+                .await
+                .context("Initialization failed")?;
+            let results = searcher.find_similar(&file_path, 10).await?;
+            output::print_similar(&results);
         }
         Commands::Config => {
             let config = config::Config::load_global_config_or_default();

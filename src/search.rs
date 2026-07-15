@@ -5,8 +5,9 @@ use crate::reranker::RerankerClient;
 use anyhow::{Context, Result};
 use log::debug;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// One search hit, fully extracted from the stored payload.
 #[derive(Debug, Clone, Serialize)]
@@ -151,6 +152,77 @@ impl Searcher {
     }
 }
 
+/// A similar-file hit for `msrch similar`.
+#[derive(Debug, Clone)]
+pub struct SimilarFile {
+    pub file_path: String,
+    pub score: f32,
+}
+
+impl Searcher {
+    /// Find files semantically similar to `file` (the file itself is excluded).
+    pub async fn find_similar(&self, file: &Path, max_results: usize) -> Result<Vec<SimilarFile>> {
+        let content = std::fs::read_to_string(file).context("Failed to read file")?;
+        if content.trim().is_empty() {
+            anyhow::bail!("File is empty");
+        }
+
+        // Truncate to fit model limits without splitting a UTF-8 char.
+        let truncated = truncate_at_char_boundary(&content, 8000);
+
+        let embedder = EmbeddingClient::new(self.config.embedding.clone())?;
+        let embeddings = embedder.embed(vec![truncated.to_string()]).await?;
+        let query_vector = embeddings
+            .into_iter()
+            .next()
+            .context("No embedding generated")?;
+
+        let db = VectorDB::new(self.msrch_dir().join("index.db")).await?;
+        let results = db.search(query_vector, 20, 0.0).await?;
+
+        Ok(dedupe_similar(
+            &results,
+            &file.display().to_string(),
+            max_results,
+        ))
+    }
+}
+
+/// Largest prefix of `s` that is at most `max_bytes` long and ends on a char boundary.
+fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    let mut end = s.len().min(max_bytes);
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Deduplicate by file path (best score first-seen), excluding the query file,
+/// capped at `max` entries.
+fn dedupe_similar(results: &[ScoredPoint], exclude_path: &str, max: usize) -> Vec<SimilarFile> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    for result in results {
+        let file_path = result
+            .payload
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if file_path == exclude_path || !seen.insert(file_path.clone()) {
+            continue;
+        }
+        out.push(SimilarFile {
+            file_path,
+            score: result.score,
+        });
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,5 +260,38 @@ mod tests {
         assert_eq!(result.chunk_index, 0);
         assert_eq!(result.context, "");
         assert_eq!(result.content, "");
+    }
+
+    #[test]
+    fn truncate_respects_char_boundaries() {
+        // 'é' is 2 bytes in UTF-8; byte 5 falls mid-char.
+        let s = "ééééé"; // 10 bytes, 5 chars
+        let t = truncate_at_char_boundary(s, 5);
+        assert_eq!(t, "éé"); // 4 bytes; byte 5 would split the third 'é'
+        assert_eq!(truncate_at_char_boundary(s, 100), s); // shorter than max: untouched
+        assert_eq!(truncate_at_char_boundary("", 8000), "");
+    }
+
+    #[test]
+    fn dedupe_similar_excludes_query_file_dedupes_and_caps() {
+        fn point(file_path: &str, score: f32) -> ScoredPoint {
+            ScoredPoint {
+                id: "id".to_string(),
+                score,
+                payload: serde_json::json!({ "file_path": file_path }),
+            }
+        }
+        let results = vec![
+            point("/repo/self.rs", 1.0),  // the query file: excluded
+            point("/repo/a.rs", 0.9),
+            point("/repo/a.rs", 0.8),     // duplicate: dropped, first score kept
+            point("/repo/b.rs", 0.7),
+            point("/repo/c.rs", 0.6),
+        ];
+        let out = dedupe_similar(&results, "/repo/self.rs", 2);
+        assert_eq!(out.len(), 2); // capped at max
+        assert_eq!(out[0].file_path, "/repo/a.rs");
+        assert_eq!(out[0].score, 0.9);
+        assert_eq!(out[1].file_path, "/repo/b.rs");
     }
 }
