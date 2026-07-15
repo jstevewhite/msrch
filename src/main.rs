@@ -147,14 +147,13 @@ async fn main() -> anyhow::Result<()> {
                 anyhow::bail!("File not found: {}", file_path.display());
             }
 
+            let searcher = search::Searcher::new(None).await?;
+
             println!(
                 "Finding files similar to: {}",
                 file_path.display().to_string().cyan()
             );
 
-            let searcher = search::Searcher::new(None)
-                .await
-                .context("Initialization failed")?;
             let results = searcher.find_similar(&file_path, 10).await?;
             output::print_similar(&results);
         }
