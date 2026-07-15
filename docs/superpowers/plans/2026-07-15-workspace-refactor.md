@@ -554,7 +554,7 @@ The Similar arm in main.rs is ~90 lines of logic (embedding, DB search, dedup) â
 - Produces: `Searcher::find_similar(&self, file: &Path, max_results: usize) -> Result<Vec<SimilarFile>>`
 - Produces: `output::print_similar(results: &[SimilarFile])`
 
-**Deliberate behavior change (document in commit):** if the embedding call fails, `similar` previously printed to stderr and exited 0; now the error propagates and the process exits non-zero.
+**Deliberate behavior changes (document in commit):** (1) if the embedding call fails, `similar` previously printed to stderr and exited 0; now the error propagates and the process exits non-zero. (2) The "Finding files similar to" header prints after index discovery but before file read/embedding, so a missing `.msrch` index emits only the original error text (byte-identical to the old binary), while errors from reading the file, embedding, or opening the index db appear after the header â€” a declared residual of the core/CLI split.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -723,14 +723,13 @@ Commands::Similar { file } => {
         anyhow::bail!("File not found: {}", file_path.display());
     }
 
+    let searcher = search::Searcher::new(None).await?;
+
     println!(
         "Finding files similar to: {}",
         file_path.display().to_string().cyan()
     );
 
-    let searcher = search::Searcher::new(None)
-        .await
-        .context("Initialization failed")?;
     let results = searcher.find_similar(&file_path, 10).await?;
     output::print_similar(&results);
 }
