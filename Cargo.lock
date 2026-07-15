@@ -3987,7 +3987,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tiktoken-rs",
- "tokio",
  "toml",
  "tree-sitter",
  "tree-sitter-go",
