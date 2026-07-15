@@ -81,7 +81,15 @@ fn extract_html(path: &Path) -> Result<Option<String>> {
 fn readability_markdown(raw: &str) -> Option<String> {
     let mut readability = dom_smoothie::Readability::new(raw, None, None).ok()?;
     let article = readability.parse().ok()?;
-    Some(html_to_markdown(article.content.as_ref()))
+    let markdown = html_to_markdown(article.content.as_ref());
+    // dom_smoothie drops an article h1 that duplicates the page title
+    // (unconditional, no config knob); the title is prime search content, so
+    // re-inject it as a top heading unless the article kept its own heading.
+    let title = article.title.trim();
+    if !title.is_empty() && !markdown.trim_start().starts_with('#') {
+        return Some(format!("# {title}\n\n{markdown}"));
+    }
+    Some(markdown)
 }
 
 fn extract_pdf(_path: &Path) -> Result<Option<String>> {
@@ -243,17 +251,9 @@ mod tests {
         let text = extract(&fixture("saved-page.html"), u64::MAX)
             .unwrap()
             .expect("article page must extract");
-        // NOTE: not asserting `# Quarterly Report` (the H1) survives. This
-        // fixture's <title> is "Quarterly Report — Q2 2026", which
-        // dom_smoothie's title-truncation (splitting on the em-dash, same
-        // heuristic as Mozilla Readability.js) reduces to "Quarterly
-        // Report" — an exact match for the <h1> text. dom_smoothie then
-        // deliberately drops that heading as a duplicate of `Article.title`
-        // (see grab.rs `should_remove_title_header`; unconditional, no
-        // `Config`/`ParsePolicy` knob disables it). This is real,
-        // intentional upstream behavior, not a bug — see task-2-report.md
-        // for the confirmed root cause and the actual extracted text.
-        // A non-duplicate heading still confirms heading structure survives.
+        // dom_smoothie strips an h1 that duplicates the page title, so
+        // readability_markdown re-injects the title as a `#` heading.
+        assert!(text.contains("# Quarterly Report"), "article heading kept: {text}");
         assert!(text.contains("## Highlights"), "article subheading kept: {text}");
         assert!(text.contains("workspace refactor"), "body kept");
         assert!(text.contains("Indexed files | 24"), "table kept: {text}");
