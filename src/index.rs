@@ -4,7 +4,6 @@ use crate::crawler::Crawler;
 use crate::db::VectorDB;
 use crate::embedding::EmbeddingClient;
 use anyhow::{Context, Result};
-use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
