@@ -58,13 +58,15 @@ fn extract_html(path: &Path) -> Result<Option<String>> {
     let raw = fs::read_to_string(path).context("read html file")?;
     let whole_page = html_to_markdown(&raw);
 
-    let main = readability_markdown(&raw);
-    let text = match main {
-        Some(m)
-            if m.trim().len() >= HTML_MIN_MAIN_CHARS
-                && m.trim().len() * HTML_MIN_MAIN_FRACTION_DENOM >= whole_page.trim().len() =>
-        {
-            m
+    let text = match readability_markdown(&raw) {
+        Some((title, body)) if readability_wins(&body, &whole_page) => {
+            // dom_smoothie strips an article h1 that duplicates the page title;
+            // the title is prime search content, so re-inject it as a heading.
+            if !title.is_empty() && !body.trim_start().starts_with('#') {
+                format!("# {title}\n\n{body}")
+            } else {
+                body
+            }
         }
         _ => whole_page,
     };
@@ -76,20 +78,24 @@ fn extract_html(path: &Path) -> Result<Option<String>> {
     Ok(Some(text))
 }
 
+/// True when readability's extracted body is substantial enough to use
+/// instead of the whole-page fallback. Measures the BODY ONLY — the injected
+/// title is synthesized metadata and must not count toward the gate.
+fn readability_wins(body: &str, whole_page: &str) -> bool {
+    body.trim().len() >= HTML_MIN_MAIN_CHARS
+        && body.trim().len() * HTML_MIN_MAIN_FRACTION_DENOM >= whole_page.trim().len()
+}
+
 /// Readability-style main-content extraction; None when parsing fails or the
-/// crate finds no article (callers fall back to whole-page text).
-fn readability_markdown(raw: &str) -> Option<String> {
+/// crate finds no article (callers fall back to whole-page text). Returns the
+/// article title and body markdown separately so the degenerate gate can
+/// measure the body alone.
+fn readability_markdown(raw: &str) -> Option<(String, String)> {
     let mut readability = dom_smoothie::Readability::new(raw, None, None).ok()?;
     let article = readability.parse().ok()?;
-    let markdown = html_to_markdown(article.content.as_ref());
-    // dom_smoothie drops an article h1 that duplicates the page title
-    // (unconditional, no config knob); the title is prime search content, so
-    // re-inject it as a top heading unless the article kept its own heading.
-    let title = article.title.trim();
-    if !title.is_empty() && !markdown.trim_start().starts_with('#') {
-        return Some(format!("# {title}\n\n{markdown}"));
-    }
-    Some(markdown)
+    let title = article.title.trim().to_string();
+    let body = html_to_markdown(article.content.as_ref());
+    Some((title, body))
 }
 
 fn extract_pdf(_path: &Path) -> Result<Option<String>> {
@@ -324,5 +330,22 @@ mod tests {
         assert!(md.contains("See the link."), "no space before period: {md}");
         assert!(md.contains("wordglued"), "source had no space — none fabricated: {md}");
         assert!(md.contains("glued and a b"), "whitespace-only text nodes still separate: {md}");
+    }
+
+    #[test]
+    fn degenerate_gate_measures_body_not_injected_title() {
+        let whole_page = "x".repeat(4000);
+        let thin_body = "Only forty characters of real content."; // < 200 chars
+        assert!(
+            !readability_wins(thin_body, &whole_page),
+            "thin body must lose regardless of how long the page title is"
+        );
+        let real_body = "y".repeat(300);
+        assert!(readability_wins(&real_body, &whole_page), "substantial body wins");
+        let tiny_page_thin_body = "z".repeat(100);
+        assert!(
+            !readability_wins(thin_body, &tiny_page_thin_body),
+            "sub-200-char body loses even when over 5% of the page"
+        );
     }
 }
