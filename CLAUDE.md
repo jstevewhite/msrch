@@ -122,6 +122,21 @@ Implementation is in `search.rs::find_index_root()`.
 - Project: merged via Config::load_for_index(index_root) — global config overlaid with .msrch/config.toml (project wins field-by-field; malformed project file warns and is ignored)
 - Note: retries and `max_file_size_mb` are pending implementation
 
+## Versioning & Releases
+
+- SemVer 0.x, single source of truth: `workspace.package.version` in the root
+  `Cargo.toml` (both crates inherit it).
+- Bump **minor** for features, roadmap items, or anything affecting index
+  compatibility (`SCHEMA_VERSION` bumps); **patch** for fixes. Bump per
+  meaningful merge to main, not per commit.
+- On every bump: update `CHANGELOG.md`, commit, then `git tag vX.Y.Z` on that
+  commit (`git push --tags` to publish).
+- `msrch --version` prints `<semver> (index schema vN, commit <hash>)`. The
+  hash is embedded by `crates/cli/build.rs` at compile time (`unknown` outside
+  a git checkout, `-dirty` suffix when the tree has uncommitted changes) —
+  build release binaries from a clean, tagged checkout so the hash is
+  authoritative.
+
 ## Important Implementation Details
 
 ### Error Handling

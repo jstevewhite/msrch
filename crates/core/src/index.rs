@@ -26,7 +26,9 @@ use std::time::SystemTime;
 /// indexes are wiped and rebuilt by this migration path rather than opened
 /// directly. (Note: `query` has no migration hook — a pre-bump index queried
 /// before any index/reindex surfaces a raw lance error; reindex to fix.)
-const SCHEMA_VERSION: u32 = 4;
+/// Public so front-ends can surface it (e.g. `msrch --version` prints it to
+/// answer "will this binary read this index?" from any machine).
+pub const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {

@@ -6,8 +6,19 @@ use msrch_core::{config, index, search};
 use output::OutputFormat;
 use std::path::PathBuf;
 
+/// Version line for `msrch --version`: semver, index schema, and build commit.
+/// e.g. `msrch 0.2.0 (index schema v4, commit a1b2c3d)`
+fn version_string() -> String {
+    format!(
+        "{} (index schema v{}, commit {})",
+        env!("CARGO_PKG_VERSION"),
+        msrch_core::index::SCHEMA_VERSION,
+        env!("MSRCH_GIT_HASH"),
+    )
+}
+
 #[derive(Parser)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = version_string(), about, long_about = None)]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
     #[command(subcommand)]
@@ -195,5 +206,18 @@ mod tests {
         let cli = Cli::try_parse_from(["msrch", "find", "the", "chunker"]).expect("should parse");
         assert_eq!(cli.query_args, vec!["find", "the", "chunker"]);
         assert!(cli.format.is_none());
+    }
+
+    #[test]
+    fn version_string_carries_semver_schema_and_commit() {
+        let v = version_string();
+        assert!(v.starts_with(env!("CARGO_PKG_VERSION")));
+        assert!(v.contains(&format!(
+            "index schema v{}",
+            msrch_core::index::SCHEMA_VERSION
+        )));
+        // Build hash is best-effort but never empty: real hash or "unknown".
+        assert!(!v.contains("commit )"), "commit hash must not be empty: {v}");
+        assert!(v.contains("commit "));
     }
 }
