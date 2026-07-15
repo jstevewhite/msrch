@@ -21,9 +21,11 @@ use std::time::SystemTime;
 /// v1: added the `context` column.
 /// v2: fixed Rust doc-comment over-collection (changes stored content/embeddings).
 /// v3: resolve type/impl/Go-type names in the context path (was "anonymous").
-/// v4: lancedb 0.23 -> 0.31 upgrade (lance storage engine 1.x -> 8.x). The new
-/// engine doesn't open tables written by the old one, so pre-bump indexes are
-/// wiped and rebuilt by this same migration path rather than opened directly.
+/// v4: lancedb 0.23 -> 0.31 upgrade (lance storage engine 1.x -> 8.x). Cross-
+/// engine compatibility of the on-disk tables was never verified, so pre-bump
+/// indexes are wiped and rebuilt by this migration path rather than opened
+/// directly. (Note: `query` has no migration hook — a pre-bump index queried
+/// before any index/reindex surfaces a raw lance error; reindex to fix.)
 const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Default)]
