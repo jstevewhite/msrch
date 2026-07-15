@@ -1,30 +1,46 @@
-use crate::OutputFormat;
 use crate::config::Config;
 use crate::db::{ScoredPoint, VectorDB};
 use crate::embedding::EmbeddingClient;
 use crate::reranker::RerankerClient;
 use anyhow::{Context, Result};
-use colored::*;
 use log::debug;
 use serde::Serialize;
-use std::collections::HashSet;
 use std::env;
 use std::path::PathBuf;
 
-#[derive(Serialize)]
-struct JsonOutput {
-    query: String,
-    index_path: String,
-    results: Vec<JsonResult>,
+/// One search hit, fully extracted from the stored payload.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResult {
+    pub file_path: String,
+    pub chunk_index: u64,
+    pub score: f32,
+    pub context: String,
+    pub content: String,
 }
 
-#[derive(Serialize)]
-struct JsonResult {
-    file_path: String,
-    chunk_index: u64,
-    similarity: f32,
-    context: String,
-    content: String,
+impl SearchResult {
+    fn from_point(point: &ScoredPoint) -> Self {
+        let p = &point.payload;
+        Self {
+            file_path: p
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string(),
+            chunk_index: p.get("chunk_index").and_then(|v| v.as_u64()).unwrap_or(0),
+            score: point.score,
+            context: p
+                .get("context")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            content: p
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }
+    }
 }
 
 pub struct Searcher {
@@ -42,20 +58,22 @@ impl Searcher {
                 .context("No .msrch index found in directory tree")?
         };
 
-        // Load config from index or global? For Search, mixing both is good.
-        // For POC, just use global defaults/config.
         let config = Config::load_global_config_or_default();
 
         Ok(Self { config, index_root })
+    }
+
+    /// The `.msrch` directory this searcher operates on.
+    pub fn msrch_dir(&self) -> PathBuf {
+        self.index_root.join(".msrch")
     }
 
     pub async fn search(
         &self,
         query_text: &str,
         limit: Option<usize>,
-        format: OutputFormat,
         use_rerank: bool,
-    ) -> Result<()> {
+    ) -> Result<Vec<SearchResult>> {
         let embedder = EmbeddingClient::new(self.config.embedding.clone())?;
 
         // Create reranker config, overriding enabled flag if --rerank passed
@@ -65,8 +83,7 @@ impl Searcher {
         }
         let reranker = RerankerClient::new(reranker_config)?;
 
-        let msrch_dir = self.index_root.join(".msrch");
-        let db = VectorDB::new(msrch_dir.join("index.db")).await?;
+        let db = VectorDB::new(self.msrch_dir().join("index.db")).await?;
 
         let embedding = embedder.embed(vec![query_text.to_string()]).await?;
         let query_vector = embedding.first().context("No embedding generated")?.clone();
@@ -122,159 +139,16 @@ impl Searcher {
                     results = reranked_results;
                 }
                 Err(e) => {
+                    // Stderr on purpose: user-visible degradation notice even
+                    // without a logger initialized (query never inits env_logger).
                     eprintln!("Reranking failed, using vector scores: {}", e);
-                    // Fall back to vector search results
                     results.truncate(limit);
                 }
             }
         }
 
-        if results.is_empty() {
-            match format {
-                OutputFormat::Json => println!(
-                    "{}",
-                    serde_json::json!({
-                        "query": query_text,
-                        "index_path": msrch_dir.display().to_string(),
-                        "results": []
-                    })
-                ),
-                _ => println!("No results found."),
-            }
-            return Ok(());
-        }
-
-        match format {
-            OutputFormat::Plain => self.display_plain(&results),
-            OutputFormat::Context => self.display_context(&results),
-            OutputFormat::Json => self.display_json(query_text, &msrch_dir, &results),
-            OutputFormat::Filename => self.display_filename(&results),
-        }
-
-        Ok(())
+        Ok(results.iter().map(SearchResult::from_point).collect())
     }
-
-    fn display_plain(&self, results: &[ScoredPoint]) {
-        for result in results {
-            let payload = &result.payload;
-            let file_path = payload
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let chunk_index = payload
-                .get("chunk_index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            println!("{}:{}", file_path, chunk_index);
-        }
-    }
-
-    fn display_context(&self, results: &[ScoredPoint]) {
-        println!("{}", format!("Found {} results:", results.len()).bold());
-        for result in results {
-            let score = result.score;
-            let payload = &result.payload;
-
-            let file_path = payload
-                .get("file_path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown");
-            let chunk_index = payload
-                .get("chunk_index")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            let content = payload
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let context = payload
-                .get("context")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            let context_suffix = if context.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", context.dimmed())
-            };
-
-            println!(
-                "\n{} {}:{}{}",
-                format!("{:.2}", score).yellow(),
-                file_path.cyan(),
-                chunk_index,
-                context_suffix
-            );
-
-            for line in content.lines().take(3) {
-                println!("  │ {}", line);
-            }
-        }
-    }
-
-    fn display_json(&self, query: &str, index_path: &PathBuf, results: &[ScoredPoint]) {
-        let json_results: Vec<JsonResult> = results
-            .iter()
-            .map(|r| {
-                let payload = &r.payload;
-                JsonResult {
-                    file_path: payload
-                        .get("file_path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
-                    chunk_index: payload
-                        .get("chunk_index")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
-                    similarity: r.score,
-                    context: payload
-                        .get("context")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    content: payload
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                }
-            })
-            .collect();
-
-        let output = JsonOutput {
-            query: query.to_string(),
-            index_path: index_path.display().to_string(),
-            results: json_results,
-        };
-
-        println!("{}", serde_json::to_string_pretty(&output).unwrap());
-    }
-
-    fn display_filename(&self, results: &[ScoredPoint]) {
-        for file_path in unique_file_paths(results) {
-            println!("{}", file_path);
-        }
-    }
-}
-
-/// Collect the distinct `file_path` values from results, preserving the order
-/// in which each path is first seen (so the most relevant file leads).
-fn unique_file_paths(results: &[ScoredPoint]) -> Vec<String> {
-    let mut seen = HashSet::new();
-    let mut paths = Vec::new();
-    for result in results {
-        let file_path = result
-            .payload
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_string();
-        if seen.insert(file_path.clone()) {
-            paths.push(file_path);
-        }
-    }
-    paths
 }
 
 #[cfg(test)]
@@ -282,26 +156,37 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn point(file_path: &str) -> ScoredPoint {
-        ScoredPoint {
+    #[test]
+    fn from_point_extracts_payload_fields() {
+        let point = ScoredPoint {
             id: "id".to_string(),
-            score: 1.0,
-            payload: json!({ "file_path": file_path }),
-        }
+            score: 0.87,
+            payload: json!({
+                "file_path": "src/chunker.rs",
+                "chunk_index": 4,
+                "context": "impl::Chunker::fn::chunk_file",
+                "content": "pub fn chunk_file(...)"
+            }),
+        };
+        let result = SearchResult::from_point(&point);
+        assert_eq!(result.file_path, "src/chunker.rs");
+        assert_eq!(result.chunk_index, 4);
+        assert_eq!(result.score, 0.87);
+        assert_eq!(result.context, "impl::Chunker::fn::chunk_file");
+        assert_eq!(result.content, "pub fn chunk_file(...)");
     }
 
     #[test]
-    fn unique_file_paths_dedupes_preserving_first_seen_order() {
-        let results = vec![
-            point("src/a.rs"),
-            point("src/b.rs"),
-            point("src/a.rs"),
-            point("src/c.rs"),
-            point("src/b.rs"),
-        ];
-        assert_eq!(
-            unique_file_paths(&results),
-            vec!["src/a.rs", "src/b.rs", "src/c.rs"]
-        );
+    fn from_point_defaults_missing_payload_fields() {
+        let point = ScoredPoint {
+            id: "id".to_string(),
+            score: 0.5,
+            payload: json!({}),
+        };
+        let result = SearchResult::from_point(&point);
+        assert_eq!(result.file_path, "unknown");
+        assert_eq!(result.chunk_index, 0);
+        assert_eq!(result.context, "");
+        assert_eq!(result.content, "");
     }
 }

@@ -4,25 +4,14 @@ mod crawler;
 mod db;
 mod embedding;
 mod index;
+mod output;
 mod reranker;
 mod search;
 
 use anyhow::Context;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Parser, Subcommand};
+use output::OutputFormat;
 use std::path::PathBuf;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Default)]
-pub enum OutputFormat {
-    /// File paths only
-    Plain,
-    /// File paths with code snippets (default)
-    #[default]
-    Context,
-    /// JSON output for scripting
-    Json,
-    /// Deduplicated file paths only (like `grep -l`)
-    Filename,
-}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -126,10 +115,11 @@ async fn main() -> anyhow::Result<()> {
             let searcher = search::Searcher::new(None)
                 .await
                 .context("Initialization failed")?;
-            searcher
-                .search(text, *limit, *format, *rerank)
+            let results = searcher
+                .search(text, *limit, *rerank)
                 .await
                 .context("Search failed")?;
+            output::render(*format, text, &searcher.msrch_dir(), &results);
         }
         Commands::Reindex => {
             let current_dir = std::env::current_dir()?;
@@ -146,7 +136,8 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Stats => {
             let current_dir = std::env::current_dir()?;
-            index::get_stats(&current_dir).await?.print();
+            let stats = index::get_stats(&current_dir).await?;
+            output::print_stats(&stats);
         }
         Commands::Similar { file } => {
             use colored::*;

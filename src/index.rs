@@ -51,38 +51,6 @@ pub struct IndexStats {
     pub endpoint: String,
 }
 
-impl IndexStats {
-    pub fn print(&self) {
-        println!("{}", "Index Statistics".bold().underline());
-        println!();
-        println!("  {:<18} {}", "Index:".cyan(), self.index_path.display());
-        println!("  {:<18} {}", "Root:".cyan(), self.root_path.display());
-        println!("  {:<18} {}", "Files:".cyan(), self.file_count);
-        println!("  {:<18} {}", "Chunks:".cyan(), self.chunk_count);
-        println!("  {:<18} ~{}", "Est. tokens:".cyan(), self.estimated_tokens);
-        println!("  {:<18} {}", "Model:".cyan(), self.model);
-        println!("  {:<18} {}", "Endpoint:".cyan(), self.endpoint);
-
-        if let Some(last) = self.last_indexed {
-            if let Ok(duration) = last.duration_since(SystemTime::UNIX_EPOCH) {
-                let datetime = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                println!("  {:<18} {}", "Last indexed:".cyan(), datetime);
-            }
-        }
-
-        let size_str = if self.size_on_disk >= 1024 * 1024 {
-            format!("{:.1} MB", self.size_on_disk as f64 / (1024.0 * 1024.0))
-        } else if self.size_on_disk >= 1024 {
-            format!("{:.1} KB", self.size_on_disk as f64 / 1024.0)
-        } else {
-            format!("{} bytes", self.size_on_disk)
-        };
-        println!("  {:<18} {}", "Size on disk:".cyan(), size_str);
-    }
-}
-
 pub fn find_index_root(start_path: &Path) -> Option<PathBuf> {
     let mut current = start_path.to_path_buf();
     loop {
