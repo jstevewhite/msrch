@@ -1253,6 +1253,12 @@ config.toml survives a rebuild (previously the whole .msrch dir was deleted)."
 
 ---
 
+## Post-review amendments (applied after the whole-branch review)
+
+- `get_stats` also switched to `Config::load_for_index` (missed caller — plan gap).
+- `SCHEMA_VERSION` bumped 3 → 4 to gate pre-lancedb-0.31 indexes behind the existing wipe-and-rebuild migration (lance storage engine 1.x → 8.x). Run `msrch reindex` after upgrading.
+- Reindex artifact deletion moved from the CLI arm into core (`index::remove_index_artifacts`) — the Task 4 sample code above encoded `.msrch` storage internals in a command handler, contradicting the zero-logic constraint.
+
 ## Out of scope (known, deliberate)
 
 - `index.rs` still prints progress (`println!`, `indicatif`, `colored`) from core. Acceptable for the CLI; must be revisited before the MCP server exposes *indexing* over stdio (stdout is the protocol channel there). Tracked implicitly by ROADMAP item 4.
