@@ -63,10 +63,14 @@ impl RerankerClient {
             documents,
         };
 
-        let response = self
-            .client
-            .post(&self.config.endpoint)
-            .json(&request)
+        let mut req = self.client.post(&self.config.endpoint).json(&request);
+
+        if let Some(key) = &self.config.api_key {
+            debug!("rerank: using bearer auth");
+            req = req.bearer_auth(key);
+        }
+
+        let response = req
             .send()
             .await
             .context("Failed to send rerank request")?;
