@@ -838,7 +838,6 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tiktoken-rs.workspace = true
-tokio.workspace = true
 toml.workspace = true
 tree-sitter.workspace = true
 tree-sitter-go.workspace = true
@@ -852,7 +851,7 @@ uuid.workspace = true
 tempfile.workspace = true
 ```
 
-(`chrono` and `colored` are deliberately absent: their only uses moved to the cli in Task 1 — Task 1's review confirmed index.rs has no remaining colored-trait calls.)
+(`chrono` and `colored` are deliberately absent: their only uses moved to the cli in Task 1 — Task 1's review confirmed index.rs has no remaining colored-trait calls. `tokio` is also absent: core's async fns await library futures but call no tokio APIs; the runtime lives in the cli's `#[tokio::main]`. Task 3's review confirmed zero tokio symbol references in core.)
 
 - [ ] **Step 4: Write `crates/cli/Cargo.toml`**
 
