@@ -5,9 +5,10 @@
 //! UTF-8. `Ok(None)` means "skip this file; the reason was already warned to
 //! stderr" — no text layer, over the size cap, or unparseable.
 
-use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
+
+use anyhow::{Context, Result};
 
 const EXTRACTABLE_EXTS: &[&str] = &["html", "htm", "xhtml", "pdf", "docx"];
 
@@ -98,16 +99,36 @@ pub(crate) fn html_to_markdown(html: &str) -> String {
         }
     }
 
-    fn emit(node: ego_tree::NodeRef<Node>, out: &mut String) {
+    // `pending_space` tracks whether the SOURCE had whitespace between the
+    // previously-emitted node and whatever comes next — it is threaded
+    // through the recursion rather than inferred from the output buffer, so
+    // that inline elements don't fabricate spaces before trailing
+    // punctuation (e.g. `<b>bold</b>,`) while whitespace-only text nodes
+    // between elements (e.g. `<b>a</b> <b>b</b>`) still join with a space.
+    fn emit(node: ego_tree::NodeRef<Node>, out: &mut String, pending_space: &mut bool) {
         match node.value() {
             Node::Text(t) => {
-                let cleaned = t.split_whitespace().collect::<Vec<_>>().join(" ");
-                if !cleaned.is_empty() {
-                    if !out.is_empty() && !out.ends_with(|c: char| c.is_whitespace()) && !out.ends_with("# ") {
-                        out.push(' ');
+                let raw: &str = t;
+                let starts_ws = raw.starts_with(|c: char| c.is_whitespace());
+                let ends_ws = raw.ends_with(|c: char| c.is_whitespace());
+                let cleaned = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+                if cleaned.is_empty() {
+                    // Whitespace-only (or empty) text node: it carries no
+                    // content of its own, but still marks that source
+                    // whitespace separates whatever comes before and after.
+                    if !raw.is_empty() {
+                        *pending_space = true;
                     }
-                    out.push_str(&cleaned);
+                    return;
                 }
+                if (*pending_space || starts_ws)
+                    && !out.is_empty()
+                    && !out.ends_with(|c: char| c.is_whitespace())
+                {
+                    out.push(' ');
+                }
+                out.push_str(&cleaned);
+                *pending_space = ends_ws;
             }
             Node::Element(el) => {
                 let tag = el.name();
@@ -116,28 +137,33 @@ pub(crate) fn html_to_markdown(html: &str) -> String {
                 }
                 if let Some(level) = heading_level(tag) {
                     ensure_block_break(out);
+                    *pending_space = false;
                     out.push_str(&"#".repeat(level));
                     out.push(' ');
                 } else if is_block(tag) {
                     ensure_block_break(out);
+                    *pending_space = false;
                     if tag == "li" {
                         out.push_str("- ");
                     }
                 }
                 for child in node.children() {
-                    emit(child, out);
+                    emit(child, out, pending_space);
                 }
                 if tag == "br" {
                     out.push('\n');
+                    *pending_space = false;
                 } else if matches!(tag, "td" | "th") {
                     out.push_str(" | ");
+                    *pending_space = false;
                 } else if heading_level(tag).is_some() || is_block(tag) {
                     ensure_block_break(out);
+                    *pending_space = false;
                 }
             }
             _ => {
                 for child in node.children() {
-                    emit(child, out);
+                    emit(child, out, pending_space);
                 }
             }
         }
@@ -145,7 +171,8 @@ pub(crate) fn html_to_markdown(html: &str) -> String {
 
     let doc = Html::parse_document(html);
     let mut out = String::new();
-    emit(doc.tree.root(), &mut out);
+    let mut pending_space = false;
+    emit(doc.tree.root(), &mut out, &mut pending_space);
 
     // Trim trailing " | " artifacts at line ends and collapse 3+ newlines.
     let cleaned = out
@@ -214,5 +241,18 @@ mod tests {
         assert!(!md.contains(".a{{}}") && !md.contains(".a{}"), "style dropped: {md}");
         assert!(!md.contains('<'), "no tags leak: {md}");
         assert!(!md.contains("\n\n\n"), "blank lines collapsed: {md}");
+    }
+
+    #[test]
+    fn html_to_markdown_preserves_source_spacing_around_inline_elements() {
+        let md = html_to_markdown(
+            "<p>This is <b>bold</b>, right? Hello <em>world</em>! See <a href='x'>the link</a>.</p>\
+             <p>word<b>glued</b> and <b>a</b> <b>b</b></p>",
+        );
+        assert!(md.contains("This is bold, right?"), "no space before comma: {md}");
+        assert!(md.contains("Hello world!"), "no space before bang: {md}");
+        assert!(md.contains("See the link."), "no space before period: {md}");
+        assert!(md.contains("wordglued"), "source had no space — none fabricated: {md}");
+        assert!(md.contains("glued and a b"), "whitespace-only text nodes still separate: {md}");
     }
 }
