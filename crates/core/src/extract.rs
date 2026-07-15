@@ -48,10 +48,42 @@ pub fn extract(path: &Path, max_bytes: u64) -> Result<Option<String>> {
     }
 }
 
-// Per-format extractors are completed in later tasks.
-fn extract_html(_path: &Path) -> Result<Option<String>> {
-    anyhow::bail!("extract_html: implemented in Task 2")
+/// Minimum main-content size (chars) below which readability output is
+/// considered degenerate and the whole-page text is used instead.
+const HTML_MIN_MAIN_CHARS: usize = 200;
+/// Main content must be at least this fraction of the whole-page text (5%).
+const HTML_MIN_MAIN_FRACTION_DENOM: usize = 20;
+
+fn extract_html(path: &Path) -> Result<Option<String>> {
+    let raw = fs::read_to_string(path).context("read html file")?;
+    let whole_page = html_to_markdown(&raw);
+
+    let main = readability_markdown(&raw);
+    let text = match main {
+        Some(m)
+            if m.trim().len() >= HTML_MIN_MAIN_CHARS
+                && m.trim().len() * HTML_MIN_MAIN_FRACTION_DENOM >= whole_page.trim().len() =>
+        {
+            m
+        }
+        _ => whole_page,
+    };
+
+    if text.trim().is_empty() {
+        eprintln!("warning: skipping {}: no extractable text", path.display());
+        return Ok(None);
+    }
+    Ok(Some(text))
 }
+
+/// Readability-style main-content extraction; None when parsing fails or the
+/// crate finds no article (callers fall back to whole-page text).
+fn readability_markdown(raw: &str) -> Option<String> {
+    let mut readability = dom_smoothie::Readability::new(raw, None, None).ok()?;
+    let article = readability.parse().ok()?;
+    Some(html_to_markdown(article.content.as_ref()))
+}
+
 fn extract_pdf(_path: &Path) -> Result<Option<String>> {
     anyhow::bail!("extract_pdf: implemented in Task 4")
 }
@@ -62,7 +94,6 @@ fn extract_docx(_path: &Path) -> Result<Option<String>> {
 /// Convert an HTML string to markdown-ish plain text: h1–h6 → `#` lines,
 /// block elements separated by blank lines, list items bulleted, table cells
 /// joined with ` | `, script/style/head dropped, whitespace normalized.
-#[allow(dead_code)] // called by extract_html from Task 2 on; exercised by tests now
 pub(crate) fn html_to_markdown(html: &str) -> String {
     use scraper::{Html, Node};
 
@@ -200,6 +231,45 @@ pub(crate) fn html_to_markdown(html: &str) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    #[test]
+    fn html_readability_keeps_article_drops_nav() {
+        let text = extract(&fixture("saved-page.html"), u64::MAX)
+            .unwrap()
+            .expect("article page must extract");
+        // NOTE: not asserting `# Quarterly Report` (the H1) survives. This
+        // fixture's <title> is "Quarterly Report — Q2 2026", which
+        // dom_smoothie's title-truncation (splitting on the em-dash, same
+        // heuristic as Mozilla Readability.js) reduces to "Quarterly
+        // Report" — an exact match for the <h1> text. dom_smoothie then
+        // deliberately drops that heading as a duplicate of `Article.title`
+        // (see grab.rs `should_remove_title_header`; unconditional, no
+        // `Config`/`ParsePolicy` knob disables it). This is real,
+        // intentional upstream behavior, not a bug — see task-2-report.md
+        // for the confirmed root cause and the actual extracted text.
+        // A non-duplicate heading still confirms heading structure survives.
+        assert!(text.contains("## Highlights"), "article subheading kept: {text}");
+        assert!(text.contains("workspace refactor"), "body kept");
+        assert!(text.contains("Indexed files | 24"), "table kept: {text}");
+        assert!(!text.contains("unsubscribe"), "footer boilerplate dropped: {text}");
+        assert!(!text.contains('<'), "no tags leak");
+    }
+
+    #[test]
+    fn html_degenerate_page_falls_back_to_whole_page_text() {
+        let text = extract(&fixture("nav-only.html"), u64::MAX)
+            .unwrap()
+            .expect("nav-only page must still extract via fallback");
+        // Readability finds no real article here; whole-page fallback keeps the links' text.
+        assert!(text.contains("January"), "fallback preserved nav text: {text}");
+        assert!(text.contains("June"));
+    }
 
     #[test]
     fn is_extractable_matches_exactly_the_supported_extensions() {
