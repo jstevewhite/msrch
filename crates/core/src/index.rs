@@ -21,7 +21,10 @@ use std::time::SystemTime;
 /// v1: added the `context` column.
 /// v2: fixed Rust doc-comment over-collection (changes stored content/embeddings).
 /// v3: resolve type/impl/Go-type names in the context path (was "anonymous").
-const SCHEMA_VERSION: u32 = 3;
+/// v4: lancedb 0.23 -> 0.31 upgrade (lance storage engine 1.x -> 8.x). The new
+/// engine doesn't open tables written by the old one, so pre-bump indexes are
+/// wiped and rebuilt by this same migration path rather than opened directly.
+const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
@@ -111,8 +114,9 @@ pub async fn get_stats(start_path: &Path) -> Result<IndexStats> {
     }
     let size_on_disk = dir_size(&msrch_dir);
 
-    // Load config for model info
-    let config = Config::load_global_config_or_default();
+    // Load the effective (project-overlaid) config so stats reports the same
+    // model/endpoint that index/query actually use.
+    let config = Config::load_for_index(&index_root);
 
     Ok(IndexStats {
         index_path: msrch_dir,
@@ -125,6 +129,21 @@ pub async fn get_stats(start_path: &Path) -> Result<IndexStats> {
         model: config.embedding.model,
         endpoint: config.embedding.endpoint,
     })
+}
+
+/// Remove the index artifacts (`index.db/`, `manifest.json`) from an index
+/// root, preserving everything else in `.msrch` — notably `config.toml`.
+pub fn remove_index_artifacts(index_root: &Path) -> Result<()> {
+    let msrch_dir = index_root.join(".msrch");
+    let db_path = msrch_dir.join("index.db");
+    if db_path.exists() {
+        std::fs::remove_dir_all(&db_path).context("Failed to remove old index db")?;
+    }
+    let manifest_path = msrch_dir.join("manifest.json");
+    if manifest_path.exists() {
+        std::fs::remove_file(&manifest_path).context("Failed to remove old manifest")?;
+    }
+    Ok(())
 }
 
 pub struct Indexer {
@@ -501,6 +520,25 @@ mod tests {
         assert_eq!(
             manifest.version, 0,
             "a missing version must read as 0 so migration is triggered"
+        );
+    }
+
+    #[test]
+    fn remove_index_artifacts_preserves_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let msrch_dir = dir.path().join(".msrch");
+        std::fs::create_dir_all(msrch_dir.join("index.db")).unwrap();
+        std::fs::write(msrch_dir.join("index.db").join("data.lance"), b"x").unwrap();
+        std::fs::write(msrch_dir.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(msrch_dir.join("config.toml"), b"[query]\ndefault_limit = 3\n").unwrap();
+
+        remove_index_artifacts(dir.path()).unwrap();
+
+        assert!(!msrch_dir.join("index.db").exists());
+        assert!(!msrch_dir.join("manifest.json").exists());
+        assert!(
+            msrch_dir.join("config.toml").exists(),
+            "project config must survive"
         );
     }
 }
