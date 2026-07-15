@@ -4,7 +4,6 @@ use crate::crawler::Crawler;
 use crate::db::VectorDB;
 use crate::embedding::EmbeddingClient;
 use anyhow::{Context, Result};
-use colored::*;
 use indicatif::{ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
@@ -22,7 +21,12 @@ use std::time::SystemTime;
 /// v1: added the `context` column.
 /// v2: fixed Rust doc-comment over-collection (changes stored content/embeddings).
 /// v3: resolve type/impl/Go-type names in the context path (was "anonymous").
-const SCHEMA_VERSION: u32 = 3;
+/// v4: lancedb 0.23 -> 0.31 upgrade (lance storage engine 1.x -> 8.x). Cross-
+/// engine compatibility of the on-disk tables was never verified, so pre-bump
+/// indexes are wiped and rebuilt by this migration path rather than opened
+/// directly. (Note: `query` has no migration hook — a pre-bump index queried
+/// before any index/reindex surfaces a raw lance error; reindex to fix.)
+const SCHEMA_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
@@ -49,38 +53,6 @@ pub struct IndexStats {
     pub size_on_disk: u64,
     pub model: String,
     pub endpoint: String,
-}
-
-impl IndexStats {
-    pub fn print(&self) {
-        println!("{}", "Index Statistics".bold().underline());
-        println!();
-        println!("  {:<18} {}", "Index:".cyan(), self.index_path.display());
-        println!("  {:<18} {}", "Root:".cyan(), self.root_path.display());
-        println!("  {:<18} {}", "Files:".cyan(), self.file_count);
-        println!("  {:<18} {}", "Chunks:".cyan(), self.chunk_count);
-        println!("  {:<18} ~{}", "Est. tokens:".cyan(), self.estimated_tokens);
-        println!("  {:<18} {}", "Model:".cyan(), self.model);
-        println!("  {:<18} {}", "Endpoint:".cyan(), self.endpoint);
-
-        if let Some(last) = self.last_indexed {
-            if let Ok(duration) = last.duration_since(SystemTime::UNIX_EPOCH) {
-                let datetime = chrono::DateTime::from_timestamp(duration.as_secs() as i64, 0)
-                    .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                println!("  {:<18} {}", "Last indexed:".cyan(), datetime);
-            }
-        }
-
-        let size_str = if self.size_on_disk >= 1024 * 1024 {
-            format!("{:.1} MB", self.size_on_disk as f64 / (1024.0 * 1024.0))
-        } else if self.size_on_disk >= 1024 {
-            format!("{:.1} KB", self.size_on_disk as f64 / 1024.0)
-        } else {
-            format!("{} bytes", self.size_on_disk)
-        };
-        println!("  {:<18} {}", "Size on disk:".cyan(), size_str);
-    }
 }
 
 pub fn find_index_root(start_path: &Path) -> Option<PathBuf> {
@@ -144,8 +116,9 @@ pub async fn get_stats(start_path: &Path) -> Result<IndexStats> {
     }
     let size_on_disk = dir_size(&msrch_dir);
 
-    // Load config for model info
-    let config = Config::load_global_config_or_default();
+    // Load the effective (project-overlaid) config so stats reports the same
+    // model/endpoint that index/query actually use.
+    let config = Config::load_for_index(&index_root);
 
     Ok(IndexStats {
         index_path: msrch_dir,
@@ -158,6 +131,21 @@ pub async fn get_stats(start_path: &Path) -> Result<IndexStats> {
         model: config.embedding.model,
         endpoint: config.embedding.endpoint,
     })
+}
+
+/// Remove the index artifacts (`index.db/`, `manifest.json`) from an index
+/// root, preserving everything else in `.msrch` — notably `config.toml`.
+pub fn remove_index_artifacts(index_root: &Path) -> Result<()> {
+    let msrch_dir = index_root.join(".msrch");
+    let db_path = msrch_dir.join("index.db");
+    if db_path.exists() {
+        std::fs::remove_dir_all(&db_path).context("Failed to remove old index db")?;
+    }
+    let manifest_path = msrch_dir.join("manifest.json");
+    if manifest_path.exists() {
+        std::fs::remove_file(&manifest_path).context("Failed to remove old manifest")?;
+    }
+    Ok(())
 }
 
 pub struct Indexer {
@@ -534,6 +522,25 @@ mod tests {
         assert_eq!(
             manifest.version, 0,
             "a missing version must read as 0 so migration is triggered"
+        );
+    }
+
+    #[test]
+    fn remove_index_artifacts_preserves_project_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let msrch_dir = dir.path().join(".msrch");
+        std::fs::create_dir_all(msrch_dir.join("index.db")).unwrap();
+        std::fs::write(msrch_dir.join("index.db").join("data.lance"), b"x").unwrap();
+        std::fs::write(msrch_dir.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(msrch_dir.join("config.toml"), b"[query]\ndefault_limit = 3\n").unwrap();
+
+        remove_index_artifacts(dir.path()).unwrap();
+
+        assert!(!msrch_dir.join("index.db").exists());
+        assert!(!msrch_dir.join("manifest.json").exists());
+        assert!(
+            msrch_dir.join("config.toml").exists(),
+            "project config must survive"
         );
     }
 }

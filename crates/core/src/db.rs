@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use arrow::array::{Float32Array, RecordBatch, RecordBatchIterator, StringArray, UInt64Array};
+use arrow::array::{Float32Array, RecordBatch, StringArray, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use futures::TryStreamExt;
 use lancedb::connection::Connection;
@@ -159,10 +159,9 @@ impl VectorDB {
             .execute()
             .await?;
 
-        // Wrap in RecordBatchIterator to satisfy IntoArrow
-        let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
+        // RecordBatch implements Scannable directly in lancedb 0.31.
         debug!("upsert_chunks: calling table.add()");
-        table.add(reader).execute().await?;
+        table.add(batch).execute().await?;
         debug!("upsert_chunks: table.add() completed successfully");
 
         Ok(())

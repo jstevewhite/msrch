@@ -64,7 +64,7 @@ cargo run -- query "search query" --limit 5 --rerank
 ### Key Modules
 
 - **`main.rs`** - CLI parsing with clap, command dispatch, implicit query support (`msrch "text"`)
-- **`config.rs`** - Global configuration via `confy` (project-specific overrides not yet wired up)
+- **`config.rs`** - Global configuration via `confy` (global + project-level overrides)
 - **`index.rs`** - Indexing orchestration, incremental updates, manifest management
 - **`search.rs`** - Query execution, index discovery (walk-up pattern), output formatting
 - **`db.rs`** - LanceDB wrapper using Arrow RecordBatch for bulk operations
@@ -108,9 +108,9 @@ Implementation is in `search.rs::find_index_root()`.
 
 ### Config Hierarchy (high to low precedence)
 1. CLI flags: `--limit`, `--rerank`, etc.
-2. Global User config: `~/.config/msrch/config.toml` (via `confy`)
-3. Hardcoded defaults in `config.rs::Default` implementations
-*(Note: Project-specific `.msrch/config.toml` is defined but not yet wired up)*
+2. Project config: `.msrch/config.toml` in the index root (field-by-field overlay)
+3. Global User config: `~/.config/msrch/config.toml` (via `confy`)
+4. Hardcoded defaults in `config.rs::Default` implementations
 
 ### Default Embedding Endpoint
 - Default: `http://r7.home.lab:7997/embeddings`
@@ -119,8 +119,8 @@ Implementation is in `search.rs::find_index_root()`.
 
 ### Config Loading
 - Global: `Config::load_global_config()` uses `confy` crate (OS-specific config dir)
-- Project: `Config::load_from_path()` is defined but currently unused
-- Note: retries, `max_file_size_mb`, and project configs are pending implementation
+- Project: merged via Config::load_for_index(index_root) — global config overlaid with .msrch/config.toml (project wins field-by-field; malformed project file warns and is ignored)
+- Note: retries and `max_file_size_mb` are pending implementation
 
 ## Important Implementation Details
 
