@@ -1,11 +1,12 @@
 # msrch
 
-**msrch** is a local-first semantic search CLI tool. It contains optimizations for codebases, but works with any text-based data. It creates per-directory indexes using embeddings and provides fast semantic queries that understand concepts, not just keywords.
+**msrch** is a local-first semantic search CLI tool. It contains optimizations for codebases, but works with any text-based data — including HTML, PDF, and docx documents. It creates per-directory indexes using embeddings and provides fast semantic queries that understand concepts, not just keywords.
 
 ## Features
 
 - **Semantic Search**: Find code by meaning, not just text matching
 - **Smart Chunking**: Tree-sitter based semantic code extraction for Rust, Python, JavaScript/TypeScript, and Go
+- **Documents Too**: Extracts and indexes text from HTML, text-layer PDF, and .docx alongside source and Markdown
 - **Local-First**: All indexes stored locally, no cloud dependencies
 - **Git-Like UX**: Automatic index discovery (walks up tree like `git`), honors `.gitignore`
 - **Incremental**: Smart reindexing based on file modification times
@@ -19,17 +20,21 @@
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/msrch.git
+git clone https://github.com/jstevewhite/msrch.git
 cd msrch
 
-# Build and install
-cargo build --release
-cargo install --path .
+# Build the release binary and install it to ~/.cargo/bin
+make install
+# or, equivalently:
+cargo install --path crates/cli
 ```
+
+`crates/cli` is the binary crate — `cargo install --path .` won't work because the
+workspace root is a virtual manifest with no package to install.
 
 ### Requirements
 
-- Rust 2024 edition
+- A recent stable Rust toolchain (2024 edition)
 - An OpenAI-compatible embedding service (local or cloud)
 
 ## Semantic Chunking
@@ -60,22 +65,39 @@ Instead of arbitrary token-based splits, msrch:
 
 See [ADDING_LANGUAGES.md](ADDING_LANGUAGES.md) for step-by-step instructions on adding support for additional languages.
 
+## Document Extraction
+
+Beyond source code, msrch extracts plain text from common document formats before
+chunking, so you can search prose the same way you search code:
+
+- **HTML** (`.html`, `.htm`, `.xhtml`) — readability-style main-content extraction, with automatic whole-page fallback for non-article pages
+- **PDF** (`.pdf`) — text-layer extraction; graphics-only/scanned PDFs are skipped with a warning (no OCR)
+- **docx** (`.docx`) — headings map to Markdown headings for structure-aware chunking
+- **Markdown / prose** — chunked directly
+
+Extraction of these document formats respects `chunking.max_file_size_mb` (default 10).
+
 ## Quick Start
 
 ### 1. Configure Embedding Service
 
-Create a config file at `~/.config/msrch/msrch.conf`:
+Create a global config file named `config.toml` in your OS config directory:
+
+- **macOS**: `~/Library/Application Support/rs.msrch/config.toml`
+- **Linux**: `~/.config/msrch/config.toml`
 
 ```toml
 [embedding]
-endpoint = "http://localhost:8765/v1"  # Your embedding service
+endpoint = "http://localhost:7997/embeddings"  # full URL to your embedding endpoint
 model = "mixedbread-ai/mxbai-embed-large-v1"
-# api_key = "sk-..."  # Optional, for OpenAI
+# api_key = "sk-..."  # optional, sent as a bearer token
 
 [query]
 default_limit = 10
 min_similarity = 0.5
 ```
+
+Run `msrch config` at any time to print the effective configuration.
 
 ### 2. Index Your Project
 
@@ -105,7 +127,8 @@ msrch "token verification"
 ```
 
 Output:
-```
+
+```text
 Found 2 results:
 0.89 src/auth/jwt.rs:23
 │ pub fn verify_token(token: &str) -> Result<Claims> {
@@ -137,31 +160,33 @@ msrch stats
 # Limit results
 msrch "error handling" --limit 5
 
-# Set minimum similarity threshold
-msrch "config parsing" --threshold 0.7
-
 # JSON output for scripting
-msrch "database" --format json | jq '.results[].file_path'
+msrch "database" --format json | jq -r '.results[].file_path'
+
+# Deduplicated file paths only (grep -l style), for piping into other tools
+msrch "database" --format filename
 
 # Use reranker for better precision (slower)
 msrch "auth logic" --rerank
 
-# Skip auto-index for this query (disable config auto_index)
+# Skip auto-index for this query (overrides query.auto_index in config)
 msrch "quick search" --no-auto-index
 
 # Filter by path substring
 msrch "config" --path src/
 
-# Filter by file modification time (inclusive after, exclusive before; units: 7d/2w/3m days/weeks/months ago; month ≈ 30 days)
-msrch "changes" --after 7d                  # last 7 days
-msrch "recent" --after 2026-07-01          # YYYY-MM-DD format
+# Filter by file modification time (after-inclusive, before-exclusive;
+# relative units: 7d / 2w / 3m = days / weeks / months ago; month ≈ 30 days)
+msrch "changes" --after 7d                 # last 7 days
+msrch "recent" --after 2026-07-01          # YYYY-MM-DD form
 msrch "old" --before 2w                    # before 2 weeks ago
-msrch "planning notes" --after 3m          # last ~3 months (m ≈ 30 days)
+msrch "planning notes" --after 3m          # last ~3 months
 msrch "window" --after 2026-07-01 --before 2026-08-01
-
-# Specify index explicitly
-msrch "query" --index /path/to/.msrch
 ```
+
+The minimum-similarity threshold is set via `query.min_similarity` in config;
+there is no CLI flag for it. Index discovery is automatic (walk-up), so there is
+no `--index` flag either — run from anywhere inside the indexed tree.
 
 ### Advanced Commands
 
@@ -177,16 +202,17 @@ msrch config
 
 Configuration is loaded in this priority order:
 
-1. CLI flags (`--threshold`, `--endpoint`, etc.)
-2. Project config: `.msrch/config.toml` (in indexed directory)
-3. User config: `~/.config/msrch/msrch.conf`
+1. CLI flags (`--limit`, `--format`, `--rerank`, `--path`, `--after`/`--before`, `--no-auto-index`)
+2. Project config: `.msrch/config.toml` in the index root (overlaid field-by-field)
+3. Global user config: `config.toml` in your OS config directory
+   (macOS: `~/Library/Application Support/rs.msrch/`, Linux: `~/.config/msrch/`)
 4. Built-in defaults
 
 ### Example Configuration
 
 ```toml
 [embedding]
-endpoint = "http://localhost:8765/v1"
+endpoint = "http://localhost:7997/embeddings"  # full URL; built-in default is http://r7.home.lab:7997/embeddings
 model = "mixedbread-ai/mxbai-embed-large-v1"
 batch_size = 32
 timeout_seconds = 30
@@ -230,7 +256,7 @@ color_output = true
 
 msrch automatically walks up the directory tree to find `.msrch/`, just like `git` finds `.git/`:
 
-```
+```text
 /home/user/projects/nebula/.msrch/    # Index is here
   └── src/
       └── auth/                       # You are here
@@ -267,7 +293,7 @@ to a repo's AGENTS.md / CLAUDE.md.
 
 Indexed directories contain:
 
-```
+```text
 <project>/
 └── .msrch/
     ├── index.db/              # Vector database (LanceDB)
@@ -330,12 +356,12 @@ msrch is built with Rust and uses:
 - **tiktoken-rs**: Token counting
 - **anyhow**: Error handling
 
-For detailed architecture, see [msrch_HLD.md](msrch_HLD.md) and [CLAUDE.md](CLAUDE.md).
+For detailed architecture, see [docs/msrch_HLD.md](docs/msrch_HLD.md) and [CLAUDE.md](CLAUDE.md).
 
 ## Performance
 
-- **Query time**: 20-100ms for typical projects
-- **Index size**: ~6-8 bytes per vector dimension (~8KB per chunk with 1024-dim model)
+- **Query time**: 20-100ms for typical projects (exact cosine scan)
+- **Index size**: 4 bytes per vector dimension (Float32), plus the stored chunk text — roughly a few KB per chunk with a 1024-dim model
 - **Memory**: ~10-200MB depending on index size
 
 ## FAQ
@@ -350,7 +376,7 @@ Yes! All indexes and file contents are stored locally. Only embeddings are sent 
 
 **Can I use this with large codebases?**
 
-Yes. msrch scales efficiently with HNSW indexing. Typical 10k-file projects query in 40-80ms.
+Yes, within reason. Vector search is currently an exact (brute-force) cosine scan over all chunks — there is no approximate (ANN) index yet — so query time grows with the number of chunks. It stays fast (tens of milliseconds) for typical projects; very large indexes will be slower.
 
 **How does incremental indexing work?**
 
@@ -358,4 +384,4 @@ msrch tracks file modification times and only re-embeds changed or new files.
 
 ## License
 
-MIT License - see LICENSE file for details.
+MIT License.
