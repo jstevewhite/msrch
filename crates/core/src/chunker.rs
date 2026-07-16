@@ -170,6 +170,11 @@ impl Chunker {
             // Markdown
             "md" | "mdx" | "markdown" => FileType::Markdown,
 
+            // Extracted documents: content arrives pre-extracted as
+            // markdown-ish text (html/docx) or plain prose (pdf) — see extract.rs.
+            "html" | "htm" | "xhtml" | "docx" => FileType::Markdown,
+            "pdf" => FileType::Prose,
+
             // Prose/text
             "txt" | "rst" | "adoc" | "asciidoc" | "org" | "tex" => FileType::Prose,
 
@@ -1187,6 +1192,26 @@ mod tests {
         assert_eq!(
             Chunker::determine_file_type(&PathBuf::from("no_extension")),
             FileType::Unknown
+        );
+    }
+
+    #[test]
+    fn extractable_extensions_route_to_markdown_or_prose() {
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("page.html")),
+            FileType::Markdown
+        );
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("page.xhtml")),
+            FileType::Markdown
+        );
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("report.docx")),
+            FileType::Markdown
+        );
+        assert_eq!(
+            Chunker::determine_file_type(&PathBuf::from("paper.pdf")),
+            FileType::Prose
         );
     }
 

@@ -64,6 +64,12 @@ impl Crawler {
             return Ok(false);
         }
 
+        // Extractable document formats (pdf, docx) are binary but wanted —
+        // the extraction stage turns them into text before chunking.
+        if crate::extract::is_extractable(path) {
+            return Ok(false);
+        }
+
         let mut file = File::open(path)?;
         let mut buffer = [0; 1024]; // Check first 1KB
         let n = file.read(&mut buffer)?;

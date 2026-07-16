@@ -26,9 +26,11 @@ use std::time::SystemTime;
 /// indexes are wiped and rebuilt by this migration path rather than opened
 /// directly. (Note: `query` has no migration hook — a pre-bump index queried
 /// before any index/reindex surfaces a raw lance error; reindex to fix.)
+/// v5: HTML/PDF/docx extraction — .html content semantics changed from raw
+/// markup to extracted text, so pre-v5 HTML chunks carry wrong embeddings.
 /// Public so front-ends can surface it (e.g. `msrch --version` prints it to
 /// answer "will this binary read this index?" from any machine).
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 5;
 
 #[derive(Serialize, Deserialize, Default)]
 struct Manifest {
@@ -257,11 +259,28 @@ impl Indexer {
                 }
             }
 
-            let content = match fs::read_to_string(&file_path) {
-                Ok(c) => c,
-                Err(_) => {
-                    pb.inc(1);
-                    continue; // Skip non-utf8 for now
+            let content = if crate::extract::is_extractable(&file_path) {
+                let max_bytes = self.config.chunking.max_file_size_mb * 1024 * 1024;
+                match crate::extract::extract(&file_path, max_bytes) {
+                    Ok(Some(text)) => text,
+                    Ok(None) => {
+                        // Reason already warned to stderr by the extractor.
+                        pb.inc(1);
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("Failed to extract {:?}: {}", file_path, e);
+                        pb.inc(1);
+                        continue;
+                    }
+                }
+            } else {
+                match fs::read_to_string(&file_path) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        pb.inc(1);
+                        continue; // Skip non-utf8 for now
+                    }
                 }
             };
 
