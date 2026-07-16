@@ -270,7 +270,7 @@ msrch/
 │       ├── src/
 │       │   ├── lib.rs               # MCP server entry point
 │       │   ├── registry.rs          # Index registry and validation
-│       │   └── tools.rs             # search, stats, list_indexes tool handlers
+│       │   └── server.rs            # search/stats/list_indexes tool handlers + transports
 │       └── Cargo.toml               # MCP crate manifest
 ├── Cargo.toml                       # Workspace manifest (version source of truth)
 ├── Cargo.lock                       # Locked dependency versions
