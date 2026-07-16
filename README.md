@@ -146,13 +146,17 @@ msrch "database" --format json | jq '.results[].file_path'
 # Use reranker for better precision (slower)
 msrch "auth logic" --rerank
 
+# Skip auto-index for this query (disable config auto_index)
+msrch "quick search" --no-auto-index
+
 # Filter by path substring
 msrch "config" --path src/
 
-# Filter by file modification time (inclusive after, exclusive before)
+# Filter by file modification time (inclusive after, exclusive before; units: 7d/2w/3m days/weeks/months ago; month ≈ 30 days)
 msrch "changes" --after 7d                  # last 7 days
 msrch "recent" --after 2026-07-01          # YYYY-MM-DD format
 msrch "old" --before 2w                    # before 2 weeks ago
+msrch "planning notes" --after 3m          # last ~3 months (m ≈ 30 days)
 msrch "window" --after 2026-07-01 --before 2026-08-01
 
 # Specify index explicitly
@@ -208,7 +212,7 @@ ignore_patterns = [
 default_limit = 10
 min_similarity = 0.5
 output_format = "context"  # plain|context|json
-auto_index = false         # refresh the index before every query
+auto_index = true   # refresh the index before every query — quiet (one line only when files changed); failures fall back to the stale index
 
 [reranker]
 enabled = false
