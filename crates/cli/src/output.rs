@@ -240,4 +240,29 @@ mod tests {
             "Found 5 results (reranked):"
         );
     }
+
+    #[test]
+    fn json_output_carries_score_kind_and_omits_empty_warnings() {
+        let out = JsonOutput {
+            query: "q".to_string(),
+            index_path: "/x/.msrch".to_string(),
+            score_kind: "vector",
+            warnings: vec![],
+            results: vec![],
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["score_kind"], "vector");
+        assert!(v.get("warnings").is_none(), "empty warnings must be omitted");
+
+        let out = JsonOutput {
+            query: "q".to_string(),
+            index_path: "/x/.msrch".to_string(),
+            score_kind: "reranker",
+            warnings: vec!["Reranking failed, using vector scores: boom".to_string()],
+            results: vec![],
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        assert_eq!(v["score_kind"], "reranker");
+        assert_eq!(v["warnings"][0], "Reranking failed, using vector scores: boom");
+    }
 }
