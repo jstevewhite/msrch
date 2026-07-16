@@ -163,6 +163,12 @@ fn docx_xml_to_markdown(xml: &str) -> String {
     let mut in_text = false;
     let mut in_row = false;
     let mut row = String::new();
+    // Depth of `w:tbl` nesting. Row/cell state (`in_row`/`row`) is driven by
+    // `tr`/`tc` only at depth 1 — a table nested inside a cell (depth >= 2)
+    // must not clear or flush the enclosing row. Its `w:t` content still
+    // accumulates into `para` via the text arms below, so it flattens into
+    // the outer cell instead of being lost or misrouted.
+    let mut tbl_depth = 0usize;
 
     loop {
         match reader.read_event() {
@@ -172,7 +178,8 @@ fn docx_xml_to_markdown(xml: &str) -> String {
                     heading = 0;
                 }
                 b"t" => in_text = true,
-                b"tr" => {
+                b"tbl" => tbl_depth += 1,
+                b"tr" if tbl_depth == 1 => {
                     in_row = true;
                     row.clear();
                     para.clear();
@@ -190,15 +197,42 @@ fn docx_xml_to_markdown(xml: &str) -> String {
                 _ => {}
             },
             Ok(Event::Text(t)) if in_text => {
-                // quick-xml 0.41 dropped `BytesText::unescape()`; `decode()`
-                // only resolves byte encoding, not XML entities like
-                // `&amp;`, so entity-unescaping is a separate explicit step
-                // via the free function `quick_xml::escape::unescape`.
+                // No `escape::unescape()` call here: quick-xml 0.41's reader
+                // tokenizes every `&name;` / `&#N;` reference as its own
+                // `Event::GeneralRef` (handled below) before it ever reaches
+                // `Event::Text`, so well-formed XML text content cannot
+                // contain a literal `&` for unescape to act on. Verified by
+                // `docx_entities_and_char_refs_resolve_into_text`, which
+                // passes identically with or without an unescape() call here.
                 if let Ok(decoded) = t.decode() {
-                    match quick_xml::escape::unescape(&decoded) {
-                        Ok(s) => para.push_str(&s),
-                        Err(_) => para.push_str(&decoded),
-                    }
+                    para.push_str(&decoded);
+                }
+            }
+            // quick-xml 0.41 tokenizes `&name;` / `&#N;` references as their
+            // own `Event::GeneralRef(BytesRef)` event — they never reach the
+            // `Event::Text` arm above, so without this arm the reader silently
+            // drops the reference (e.g. "AT&T" -> "ATT"). Numeric refs resolve
+            // via `BytesRef::resolve_char_ref()`; named refs (amp/lt/gt/quot/
+            // apos) resolve via the free function
+            // `quick_xml::escape::resolve_predefined_entity`. An unresolvable
+            // reference (e.g. a custom DTD entity) is dropped with a debug
+            // log rather than aborting extraction.
+            Ok(Event::GeneralRef(bref)) if in_text => match bref.resolve_char_ref() {
+                Ok(Some(ch)) => para.push(ch),
+                Ok(None) => match bref.decode() {
+                    Ok(name) => match quick_xml::escape::resolve_predefined_entity(&name) {
+                        Some(resolved) => para.push_str(resolved),
+                        None => log::debug!("docx: unresolved entity reference &{name};"),
+                    },
+                    Err(e) => log::debug!("docx: undecodable entity reference: {e}"),
+                },
+                Err(e) => log::debug!("docx: invalid character reference: {e}"),
+            },
+            // CData sections are rare in docx but legal; their content never
+            // reaches `Event::Text` either, so it would otherwise be dropped.
+            Ok(Event::CData(t)) if in_text => {
+                if let Ok(decoded) = t.decode() {
+                    para.push_str(&decoded);
                 }
             }
             Ok(Event::End(e)) => match e.local_name().as_ref() {
@@ -214,7 +248,8 @@ fn docx_xml_to_markdown(xml: &str) -> String {
                         out.push_str("\n\n");
                     }
                 }
-                b"tc" => {
+                b"tbl" => tbl_depth = tbl_depth.saturating_sub(1),
+                b"tc" if tbl_depth == 1 => {
                     let cell = para.trim();
                     if !row.is_empty() {
                         row.push_str(" | ");
@@ -222,7 +257,7 @@ fn docx_xml_to_markdown(xml: &str) -> String {
                     row.push_str(cell);
                     para.clear();
                 }
-                b"tr" => {
+                b"tr" if tbl_depth == 1 => {
                     in_row = false;
                     if !row.trim().is_empty() {
                         out.push_str(row.trim());
@@ -533,6 +568,46 @@ mod tests {
         let p = dir.path().join("corrupt.docx");
         std::fs::write(&p, b"this is not a zip archive").unwrap();
         assert!(extract(&p, u64::MAX).unwrap().is_none(), "corrupt docx → skip, not Err");
+    }
+
+    #[test]
+    fn docx_entities_and_char_refs_resolve_into_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+ <w:body>
+  <w:p><w:r><w:t>AT&amp;T reported R&amp;D growth&#8212;strong quarter&#8217;s end.</w:t></w:r></w:p>
+ </w:body>
+</w:document>"#;
+        let p = write_docx(&dir, "entities.docx", xml);
+        let text = extract(&p, u64::MAX).unwrap().expect("must extract");
+        assert!(text.contains("AT&T reported R&D growth—strong quarter’s end."), "entities resolved, nothing dropped: {text}");
+    }
+
+    #[test]
+    fn docx_nested_table_does_not_corrupt_outer_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+ <w:body>
+  <w:tbl>
+   <w:tr>
+    <w:tc><w:p><w:r><w:t>outer-a</w:t></w:r></w:p>
+     <w:tbl><w:tr><w:tc><w:p><w:r><w:t>inner</w:t></w:r></w:p></w:tc></w:tr></w:tbl>
+    </w:tc>
+    <w:tc><w:p><w:r><w:t>outer-b</w:t></w:r></w:p></w:tc>
+   </w:tr>
+  </w:tbl>
+  <w:p><w:r><w:t>after table</w:t></w:r></w:p>
+ </w:body>
+</w:document>"#;
+        let p = write_docx(&dir, "nested.docx", xml);
+        let text = extract(&p, u64::MAX).unwrap().expect("must extract");
+        // Outer row stays one line containing both outer cells (inner content flattens into the first cell).
+        let row_line = text.lines().find(|l| l.contains("outer-a")).expect("row line exists");
+        assert!(row_line.contains("outer-b"), "outer cells on one row line: {text}");
+        assert!(text.contains("inner"), "nested content not lost: {text}");
+        assert!(text.contains("after table"), "post-table paragraph intact: {text}");
     }
 
     #[test]
