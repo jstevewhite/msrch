@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/cli", "crates/mcp"]
 
 [workspace.package]
 version = "0.5.0"
@@ -10,6 +10,7 @@ license = "MIT"
 [workspace.dependencies]
 anyhow = "1.0.100"
 arrow = "58.3.0"
+axum = "0.8.9"
 chrono = "0.4"
 clap = { version = "4.5.53", features = ["derive", "env", "string"] }
 colored = "3.0.0"
@@ -24,6 +25,8 @@ log = "0.4"
 pdf-extract = "0.12.0"
 quick-xml = "0.41.0"
 reqwest = { version = "0.12.28", features = ["json", "blocking"] }
+rmcp = { version = "2.2.0", features = ["server", "macros", "transport-io", "transport-streamable-http-server", "schemars"] }
+schemars = "1"
 scraper = "0.27.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.147"
@@ -40,3 +43,4 @@ tree-sitter-typescript = "0.23.2"
 uuid = { version = "1.19.0", features = ["serde", "v4"] }
 zip = "8.6.0"
 msrch-core = { path = "crates/core" }
+msrch-mcp = { path = "crates/mcp" }
