@@ -269,7 +269,7 @@ impl Config {
         match Self::load_global_config() {
             Ok(config) => config,
             Err(e) => {
-                eprintln!("warning: failed to load config, falling back to defaults: {e}");
+                eprintln!("warning: failed to load config, falling back to defaults: {e:#}");
                 Self::default()
             }
         }
