@@ -8,6 +8,7 @@ use serde::Serialize;
 use std::collections::HashSet;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// One search hit, fully extracted from the stored payload.
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +45,29 @@ impl SearchResult {
     }
 }
 
+/// Options for a search request. Front-ends build this; core executes it.
+/// Designed as a struct so the future MCP front-end can map protocol
+/// requests onto it without signature churn.
+#[derive(Debug, Clone, Default)]
+pub struct SearchOptions {
+    /// Max results; `None` uses the config's `default_limit`.
+    pub limit: Option<usize>,
+    /// Force reranking on (OR'd with config `reranker.enabled`).
+    pub use_rerank: bool,
+    /// Substring match against the stored absolute file path.
+    pub path_contains: Option<String>,
+    /// Inclusive lower bound on file modification time.
+    pub after: Option<SystemTime>,
+    /// Exclusive upper bound on file modification time.
+    pub before: Option<SystemTime>,
+}
+
+/// Escape a string for embedding in a SQL LIKE '...' literal: single quotes
+/// double; `%`/`_` deliberately pass through (documented wildcard bonus).
+fn sql_like_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 pub struct Searcher {
     config: Config,
     index_root: PathBuf,
@@ -73,14 +97,13 @@ impl Searcher {
     pub async fn search(
         &self,
         query_text: &str,
-        limit: Option<usize>,
-        use_rerank: bool,
+        opts: &SearchOptions,
     ) -> Result<Vec<SearchResult>> {
         let embedder = EmbeddingClient::new(self.config.embedding.clone())?;
 
-        // Create reranker config, overriding enabled flag if --rerank passed
+        // Create reranker config, overriding enabled flag if requested
         let mut reranker_config = self.config.reranker.clone();
-        if use_rerank {
+        if opts.use_rerank {
             reranker_config.enabled = true;
         }
         let reranker = RerankerClient::new(reranker_config)?;
@@ -90,8 +113,15 @@ impl Searcher {
         let embedding = embedder.embed(vec![query_text.to_string()]).await?;
         let query_vector = embedding.first().context("No embedding generated")?.clone();
 
-        let limit = limit.unwrap_or(self.config.query.default_limit);
+        let limit = opts.limit.unwrap_or(self.config.query.default_limit);
         let min_score = self.config.query.min_similarity;
+
+        // Filtering wired in the date-filter change; path predicate is live now.
+        let predicate = opts
+            .path_contains
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .map(|p| format!("file_path LIKE '%{}%'", sql_like_escape(p)));
 
         // If reranker enabled, fetch more candidates for reranking
         let fetch_limit = if reranker.is_enabled() {
@@ -101,7 +131,12 @@ impl Searcher {
         };
 
         let mut results = db
-            .search(query_vector, fetch_limit as u64, min_score)
+            .search(
+                query_vector,
+                fetch_limit as u64,
+                min_score,
+                predicate.as_deref(),
+            )
             .await?;
 
         // Apply reranking if enabled
@@ -179,7 +214,7 @@ impl Searcher {
             .context("No embedding generated")?;
 
         let db = VectorDB::new(self.msrch_dir().join("index.db")).await?;
-        let results = db.search(query_vector, 20, 0.0).await?;
+        let results = db.search(query_vector, 20, 0.0, None).await?;
 
         Ok(dedupe_similar(
             &results,
@@ -271,6 +306,23 @@ mod tests {
         assert_eq!(t, "éé"); // 4 bytes; byte 5 would split the third 'é'
         assert_eq!(truncate_at_char_boundary(s, 100), s); // shorter than max: untouched
         assert_eq!(truncate_at_char_boundary("", 8000), "");
+    }
+
+    #[test]
+    fn sql_like_escape_doubles_single_quotes_only() {
+        assert_eq!(sql_like_escape("it's a 'test'"), "it''s a ''test''");
+        assert_eq!(sql_like_escape("plain/path"), "plain/path");
+        // % and _ pass through — documented LIKE-wildcard bonus.
+        assert_eq!(sql_like_escape("week-%_x"), "week-%_x");
+    }
+
+    #[test]
+    fn search_options_default_is_all_off() {
+        let opts = SearchOptions::default();
+        assert!(opts.limit.is_none());
+        assert!(!opts.use_rerank);
+        assert!(opts.path_contains.is_none());
+        assert!(opts.after.is_none() && opts.before.is_none());
     }
 
     #[test]

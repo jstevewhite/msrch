@@ -120,8 +120,13 @@ async fn main() -> anyhow::Result<()> {
             let searcher = search::Searcher::new(None)
                 .await
                 .context("Initialization failed")?;
+            let opts = search::SearchOptions {
+                limit: *limit,
+                use_rerank: *rerank,
+                ..Default::default()
+            };
             let results = searcher
-                .search(text, *limit, *rerank)
+                .search(text, &opts)
                 .await
                 .context("Search failed")?;
             output::render(*format, text, &searcher.msrch_dir(), &results);

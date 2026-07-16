@@ -218,6 +218,7 @@ impl VectorDB {
         vector: Vec<f32>,
         limit: u64,
         min_score: f32,
+        filter: Option<&str>,
     ) -> Result<Vec<ScoredPoint>> {
         let table = self
             .connection
@@ -225,12 +226,14 @@ impl VectorDB {
             .execute()
             .await?;
 
-        let results = table
+        let mut query = table
             .vector_search(vector)?
             .distance_type(DistanceType::Cosine)
-            .limit(limit as usize)
-            .execute()
-            .await?;
+            .limit(limit as usize);
+        if let Some(predicate) = filter {
+            query = query.only_if(predicate);
+        }
+        let results = query.execute().await?;
 
         let mut points = Vec::new();
         let mut stream = results;
