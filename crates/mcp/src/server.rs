@@ -1,6 +1,7 @@
 //! Tool handlers and transport startup. Handlers are plain async methods
-//! (`*_impl`) returning Result<serde_json::Value, String> so they unit-test
-//! without a transport; thin #[tool] wrappers adapt them to rmcp.
+//! (`*_impl`) returning Result<serde_json::Value, ToolError> so they
+//! unit-test without a transport; thin #[tool] wrappers adapt them to rmcp,
+//! mapping ToolError to the right MCP error code.
 
 use crate::registry::{IndexEntry, IndexRegistry};
 use anyhow::{Context, Result};
@@ -32,6 +33,44 @@ pub struct McpOptions {
 }
 
 pub const DEFAULT_BIND: &str = "127.0.0.1:7920";
+
+/// Tool-handler error, classified so the MCP layer reports the right code:
+/// InvalidParams = the client's arguments are wrong (don't retry as-is);
+/// Internal = the server/backends failed (arguments were fine).
+#[derive(Debug)]
+pub(crate) enum ToolError {
+    InvalidParams(String),
+    Internal(String),
+}
+
+impl ToolError {
+    /// Only used by tests (production call sites match on the variant
+    /// directly via `From<ToolError> for McpError`), but kept as the
+    /// documented accessor for inspecting the underlying message.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            ToolError::InvalidParams(m) | ToolError::Internal(m) => m,
+        }
+    }
+}
+
+/// Bare-string errors from within the impl layer (arg validation, date
+/// parsing, registry resolution) are always client-caused.
+impl From<String> for ToolError {
+    fn from(msg: String) -> Self {
+        ToolError::InvalidParams(msg)
+    }
+}
+
+impl From<ToolError> for McpError {
+    fn from(e: ToolError) -> Self {
+        match e {
+            ToolError::InvalidParams(msg) => McpError::invalid_params(msg, None),
+            ToolError::Internal(msg) => McpError::internal_error(msg, None),
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchArgs {
@@ -77,7 +116,7 @@ impl MsrchServer {
         self.registry.resolve(index).map_err(|e| format!("{e:#}"))
     }
 
-    pub(crate) fn list_indexes_impl(&self) -> Result<serde_json::Value, String> {
+    pub(crate) fn list_indexes_impl(&self) -> Result<serde_json::Value, ToolError> {
         let list: Vec<serde_json::Value> = self
             .registry
             .entries()
@@ -99,11 +138,11 @@ impl MsrchServer {
     pub(crate) async fn stats_impl(
         &self,
         index: Option<String>,
-    ) -> Result<serde_json::Value, String> {
+    ) -> Result<serde_json::Value, ToolError> {
         let entry = self.resolve(index.as_deref())?;
         let stats = msrch_core::index::get_stats(&entry.root)
             .await
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| ToolError::Internal(format!("{e:#}")))?;
         let last_indexed = stats
             .last_indexed
             .map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
@@ -121,14 +160,17 @@ impl MsrchServer {
         }))
     }
 
-    pub(crate) async fn search_impl(&self, args: SearchArgs) -> Result<serde_json::Value, String> {
+    pub(crate) async fn search_impl(
+        &self,
+        args: SearchArgs,
+    ) -> Result<serde_json::Value, ToolError> {
         // Validate before any I/O.
         if let Some(m) = args.min_similarity
             && !(0.0..=1.0).contains(&m)
         {
-            return Err(format!(
+            return Err(ToolError::InvalidParams(format!(
                 "min_similarity {m} is out of range; must be between 0.0 and 1.0"
-            ));
+            )));
         }
         let after = args
             .after
@@ -158,7 +200,7 @@ impl MsrchServer {
 
         let searcher = msrch_core::search::Searcher::new(Some(entry.root.clone()))
             .await
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| ToolError::Internal(format!("{e:#}")))?;
         let opts = msrch_core::search::SearchOptions {
             limit: args.limit,
             use_rerank: args.rerank.unwrap_or(false),
@@ -170,7 +212,7 @@ impl MsrchServer {
         let results = searcher
             .search(&args.query, &opts)
             .await
-            .map_err(|e| format!("{e:#}"))?;
+            .map_err(|e| ToolError::Internal(format!("{e:#}")))?;
 
         let json_results: Vec<serde_json::Value> = results
             .iter()
@@ -207,7 +249,7 @@ impl MsrchServer {
     ) -> Result<CallToolResult, McpError> {
         match self.search_impl(args).await {
             Ok(v) => Ok(CallToolResult::success(vec![ContentBlock::json(v)?])),
-            Err(msg) => Err(McpError::invalid_params(msg, None)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -220,7 +262,7 @@ impl MsrchServer {
     ) -> Result<CallToolResult, McpError> {
         match self.stats_impl(args.index).await {
             Ok(v) => Ok(CallToolResult::success(vec![ContentBlock::json(v)?])),
-            Err(msg) => Err(McpError::invalid_params(msg, None)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -230,7 +272,7 @@ impl MsrchServer {
     async fn list_indexes(&self) -> Result<CallToolResult, McpError> {
         match self.list_indexes_impl() {
             Ok(v) => Ok(CallToolResult::success(vec![ContentBlock::json(v)?])),
-            Err(msg) => Err(McpError::internal_error(msg, None)),
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -329,10 +371,21 @@ mod tests {
         let (_dir, server) = fixture_server(&["alpha", "beta"]);
         // Ambiguous: two indexes, no name.
         let err = server.stats_impl(None).await.unwrap_err();
-        assert!(err.contains("alpha") && err.contains("beta"), "{err}");
+        assert!(
+            matches!(err, ToolError::InvalidParams(_)),
+            "ambiguous index name must be InvalidParams, got {err:?}"
+        );
+        assert!(
+            err.message().contains("alpha") && err.message().contains("beta"),
+            "{err:?}"
+        );
         // Unknown name.
         let err = server.stats_impl(Some("nope".into())).await.unwrap_err();
-        assert!(err.contains("unknown index 'nope'"), "{err}");
+        assert!(
+            matches!(err, ToolError::InvalidParams(_)),
+            "unknown index name must be InvalidParams, got {err:?}"
+        );
+        assert!(err.message().contains("unknown index 'nope'"), "{err:?}");
         // Valid: stats over the fixture manifest (no DB → chunk_count 0).
         let value = server.stats_impl(Some("alpha".into())).await.unwrap();
         assert_eq!(value["file_count"], 1);
@@ -354,7 +407,11 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(err.contains("between 0.0 and 1.0"), "{err}");
+        assert!(
+            matches!(err, ToolError::InvalidParams(_)),
+            "out-of-range min_similarity must be InvalidParams, got {err:?}"
+        );
+        assert!(err.message().contains("between 0.0 and 1.0"), "{err:?}");
 
         let err = server
             .search_impl(SearchArgs {
@@ -369,6 +426,41 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(err.contains("YYYY-MM-DD"), "date error lists forms: {err}");
+        assert!(
+            matches!(err, ToolError::InvalidParams(_)),
+            "unparseable date must be InvalidParams, got {err:?}"
+        );
+        assert!(
+            err.message().contains("YYYY-MM-DD"),
+            "date error lists forms: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_backend_failure_is_internal_not_invalid_params() {
+        let (dir, server) = fixture_server(&["alpha"]);
+        // Point the index's own config at a dead endpoint (immediate refusal).
+        std::fs::write(
+            dir.path().join("alpha/.msrch/config.toml"),
+            "[embedding]\nendpoint = \"http://127.0.0.1:1/embeddings\"\n",
+        )
+        .unwrap();
+        let err = server
+            .search_impl(SearchArgs {
+                query: "q".into(),
+                index: None,
+                limit: None,
+                rerank: None,
+                min_similarity: None,
+                path_contains: None,
+                after: None,
+                before: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Internal(_)),
+            "backend outage must be Internal, got {err:?}"
+        );
     }
 }
