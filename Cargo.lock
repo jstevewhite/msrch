@@ -4406,6 +4406,7 @@ dependencies = [
  "env_logger",
  "log",
  "msrch-core",
+ "msrch-mcp",
  "serde",
  "serde_json",
  "tokio",

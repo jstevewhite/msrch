@@ -29,6 +29,12 @@ fn parse_min_similarity(s: &str) -> Result<f32, String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum McpTransportArg {
+    Stdio,
+    Http,
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version = version_string(), about, long_about = None)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -115,6 +121,19 @@ enum Commands {
     Similar { file: PathBuf },
     /// Show effective configuration
     Config,
+    /// Serve search over the Model Context Protocol (stdio or HTTP)
+    Mcp {
+        /// Transport: stdio (per-project child process) or http (long-running)
+        #[arg(long, value_enum, default_value_t = McpTransportArg::Stdio)]
+        transport: McpTransportArg,
+        /// Register an index root: 'name=path' or bare 'path' (name = dir
+        /// basename). Repeatable. Default: walk-up discovery from cwd.
+        #[arg(long)]
+        index: Vec<String>,
+        /// http only: listen address (default 127.0.0.1:7920)
+        #[arg(long)]
+        bind: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -252,6 +271,17 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+        Commands::Mcp { transport, index, bind } => {
+            let options = msrch_mcp::McpOptions {
+                transport: match transport {
+                    McpTransportArg::Stdio => msrch_mcp::TransportKind::Stdio,
+                    McpTransportArg::Http => msrch_mcp::TransportKind::Http,
+                },
+                index_flags: index.clone(),
+                bind: bind.clone(),
+            };
+            msrch_mcp::serve(options).await.context("MCP server failed")?;
+        }
     }
 
     Ok(())
@@ -347,5 +377,33 @@ mod tests {
             err.to_string().contains("between 0.0 and 1.0"),
             "range in message for 2.0: {err}"
         );
+    }
+
+    #[test]
+    fn mcp_subcommand_parses_transports_indexes_and_bind() {
+        let cli = Cli::try_parse_from(["msrch", "mcp"]).expect("bare mcp parses");
+        match cli.command {
+            Some(Commands::Mcp { transport, index, bind }) => {
+                assert_eq!(transport, McpTransportArg::Stdio);
+                assert!(index.is_empty());
+                assert!(bind.is_none());
+            }
+            other => panic!("expected Mcp, got {other:?}"),
+        }
+
+        let cli = Cli::try_parse_from([
+            "msrch", "mcp", "--transport", "http",
+            "--index", "work=/data/reports", "--index", "/code/msrch",
+            "--bind", "0.0.0.0:7920",
+        ])
+        .expect("full http form parses");
+        match cli.command {
+            Some(Commands::Mcp { transport, index, bind }) => {
+                assert_eq!(transport, McpTransportArg::Http);
+                assert_eq!(index, vec!["work=/data/reports".to_string(), "/code/msrch".to_string()]);
+                assert_eq!(bind.as_deref(), Some("0.0.0.0:7920"));
+            }
+            other => panic!("expected Mcp, got {other:?}"),
+        }
     }
 }
