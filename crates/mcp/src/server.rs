@@ -218,24 +218,7 @@ impl MsrchServer {
 
         // Same quiet, non-fatal, schema-guarded freshness as the CLI.
         let config = msrch_core::config::Config::load_for_index(&entry.root);
-        let mut refreshed = 0usize;
-        // Locks are built from the registry, so `get` always finds an entry
-        // for a resolved index; if `try_lock` fails, another request is
-        // already refreshing this root — the quiet/non-fatal contract says
-        // search what exists now rather than wait.
-        if config.query.auto_index
-            && let Some(lock) = self.state.auto_index_locks.get(&entry.name)
-            && let Ok(_guard) = lock.try_lock()
-        {
-            let indexer = msrch_core::index::Indexer::new(entry.root.clone(), config.clone());
-            match indexer.index_quiet().await {
-                Ok(n) => refreshed = n,
-                Err(e) => eprintln!(
-                    "warning: auto-index failed for '{}' ({e:#}); searching the existing index",
-                    entry.name
-                ),
-            }
-        }
+        let (refreshed, auto_warnings) = self.run_auto_index(entry, &config).await;
 
         let searcher = msrch_core::search::Searcher::new(Some(entry.root.clone()))
             .await
@@ -253,35 +236,99 @@ impl MsrchServer {
             .await
             .map_err(|e| ToolError::Internal(format!("{e:#}")))?;
 
-        let json_results: Vec<serde_json::Value> = outcome
-            .results
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "file_path": r.file_path,
-                    "chunk_index": r.chunk_index,
-                    "similarity": r.score,
-                    "context": r.context,
-                    "content": r.content,
-                })
-            })
-            .collect();
-        let mut out = serde_json::json!({
-            "index": entry.name,
-            "query": args.query,
-            "results": json_results,
-        });
-        if refreshed > 0 {
-            out["auto_index_refreshed"] = serde_json::json!(refreshed);
-        }
-        Ok(out)
+        Ok(build_search_response(
+            &entry.name,
+            &args.query,
+            &outcome,
+            refreshed,
+            auto_warnings,
+        ))
     }
+
+    /// Config-gated, race-locked, non-fatal freshness pass. Returns the
+    /// refreshed-file count and any degradation warnings (also mirrored to
+    /// the server's stderr for operator visibility).
+    pub(crate) async fn run_auto_index(
+        &self,
+        entry: &IndexEntry,
+        config: &msrch_core::config::Config,
+    ) -> (usize, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut refreshed = 0usize;
+        if config.query.auto_index
+            && let Some(lock) = self.state.auto_index_locks.get(&entry.name)
+        {
+            match lock.try_lock() {
+                Ok(_guard) => {
+                    let indexer =
+                        msrch_core::index::Indexer::new(entry.root.clone(), config.clone());
+                    match indexer.index_quiet().await {
+                        Ok(n) => refreshed = n,
+                        Err(e) => {
+                            let msg = format!(
+                                "auto-index failed for '{}' ({e:#}); searching the existing index",
+                                entry.name
+                            );
+                            eprintln!("warning: {msg}");
+                            warnings.push(msg);
+                        }
+                    }
+                }
+                // Another request is already refreshing this root; the
+                // quiet/non-fatal contract says search what exists now.
+                Err(_) => warnings.push(format!(
+                    "auto-index skipped: a refresh is already in flight for '{}'",
+                    entry.name
+                )),
+            }
+        }
+        (refreshed, warnings)
+    }
+}
+
+/// Assemble the search tool's response. Core warnings come first, then
+/// MCP-layer ones; empty warnings and zero refreshed are omitted entirely.
+fn build_search_response(
+    index: &str,
+    query: &str,
+    outcome: &msrch_core::search::SearchOutcome,
+    refreshed: usize,
+    extra_warnings: Vec<String>,
+) -> serde_json::Value {
+    let json_results: Vec<serde_json::Value> = outcome
+        .results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "file_path": r.file_path,
+                "chunk_index": r.chunk_index,
+                "similarity": r.score,
+                "context": r.context,
+                "content": r.content,
+            })
+        })
+        .collect();
+    let mut out = serde_json::json!({
+        "index": index,
+        "query": query,
+        "score_kind": outcome.score_kind.as_str(),
+        "results": json_results,
+    });
+    if refreshed > 0 {
+        out["auto_index_refreshed"] = serde_json::json!(refreshed);
+    }
+    let mut warnings = outcome.warnings.clone();
+    warnings.extend(extra_warnings);
+    if !warnings.is_empty() {
+        out["warnings"] = serde_json::json!(warnings);
+    }
+    out
 }
 
 #[tool_router]
 impl MsrchServer {
     #[tool(
-        description = "Semantic search over an indexed directory tree. Returns ranked chunks with file paths. Filters: path substring, modification-date bounds (YYYY-MM-DD or 7d/2w/3m), minimum similarity, optional reranking."
+        description = "Semantic search over an indexed directory tree. Returns ranked chunks with file paths. Filters: path substring, modification-date bounds (YYYY-MM-DD or 7d/2w/3m), minimum similarity, optional reranking. Results carry score_kind (vector|reranker — reranker scores use their own scale) and a warnings array for degradations."
     )]
     async fn search(
         &self,
@@ -626,6 +673,67 @@ mod tests {
             mtime_before, mtime_after,
             "auto-index must not have touched the manifest while the lock was held"
         );
+    }
+
+    #[tokio::test]
+    async fn run_auto_index_reports_skip_and_failure_warnings() {
+        // Fixture root with auto_index enabled and a dead embedding endpoint.
+        let (dir, server) = fixture_server(&["alpha"]);
+        std::fs::write(
+            dir.path().join("alpha/.msrch/config.toml"),
+            "[embedding]\nendpoint = \"http://127.0.0.1:1/embeddings\"\n[query]\nauto_index = true\n",
+        )
+        .unwrap();
+        // A real, non-hidden file for the crawler to pick up — the manifest's
+        // "/a.md" entry doesn't exist on disk, so without this index_quiet
+        // would crawl to nothing and never reach the embedder.
+        std::fs::write(dir.path().join("alpha/note.txt"), "hello world").unwrap();
+        let entry = server.state.registry.resolve(Some("alpha")).unwrap().clone();
+        let config = msrch_core::config::Config::load_for_index(&entry.root);
+
+        // Lock held → skip warning, no refresh, manifest untouched.
+        {
+            let _g = server.state.auto_index_locks.get("alpha").unwrap().try_lock().unwrap();
+            let (refreshed, warnings) = server.run_auto_index(&entry, &config).await;
+            assert_eq!(refreshed, 0);
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("already in flight"), "{warnings:?}");
+        }
+
+        // Lock free but endpoint dead → failure warning, non-fatal.
+        let (refreshed, warnings) = server.run_auto_index(&entry, &config).await;
+        assert_eq!(refreshed, 0);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].starts_with("auto-index failed for 'alpha'"), "{warnings:?}");
+    }
+
+    #[test]
+    fn build_search_response_shapes_fields_correctly() {
+        use msrch_core::search::{ScoreKind, SearchOutcome, SearchResult};
+        let outcome = SearchOutcome {
+            results: vec![SearchResult {
+                file_path: "/a.md".into(),
+                chunk_index: 0,
+                score: 0.5,
+                context: String::new(),
+                content: "x".into(),
+            }],
+            score_kind: ScoreKind::Reranker,
+            warnings: vec!["core warning".into()],
+        };
+        let v = build_search_response("alpha", "q", &outcome, 2, vec!["mcp warning".into()]);
+        assert_eq!(v["score_kind"], "reranker");
+        assert_eq!(v["auto_index_refreshed"], 2);
+        assert_eq!(v["warnings"][0], "core warning", "core warnings first");
+        assert_eq!(v["warnings"][1], "mcp warning");
+        assert_eq!(v["results"][0]["similarity"], 0.5);
+
+        // Empty warnings + zero refreshed → both fields omitted; vector kind maps.
+        let outcome = SearchOutcome { results: vec![], score_kind: ScoreKind::Vector, warnings: vec![] };
+        let v = build_search_response("alpha", "q", &outcome, 0, vec![]);
+        assert_eq!(v["score_kind"], "vector");
+        assert!(v.get("warnings").is_none());
+        assert!(v.get("auto_index_refreshed").is_none());
     }
 
     #[test]
