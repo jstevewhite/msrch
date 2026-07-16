@@ -1,7 +1,7 @@
 use clap::ValueEnum;
 use colored::*;
 use msrch_core::index::IndexStats;
-use msrch_core::search::{SearchResult, SimilarFile};
+use msrch_core::search::{ScoreKind, SearchOutcome, SearchResult, SimilarFile};
 use serde::Serialize;
 use std::collections::HashSet;
 use std::path::Path;
@@ -23,6 +23,9 @@ pub enum OutputFormat {
 struct JsonOutput {
     query: String,
     index_path: String,
+    score_kind: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
     results: Vec<JsonResult>,
 }
 
@@ -35,18 +38,32 @@ struct JsonResult {
     content: String,
 }
 
+/// Header line for the context format; reranked sets are labeled so the
+/// score scale is self-explanatory.
+fn context_header(n: usize, kind: ScoreKind) -> String {
+    match kind {
+        ScoreKind::Reranker => format!("Found {n} results (reranked):"),
+        ScoreKind::Vector => format!("Found {n} results:"),
+    }
+}
+
 /// Render search results in the requested format. Handles the empty case.
-pub fn render(format: OutputFormat, query: &str, msrch_dir: &Path, results: &[SearchResult]) {
+pub fn render(format: OutputFormat, query: &str, msrch_dir: &Path, outcome: &SearchOutcome) {
+    let results = &outcome.results;
     if results.is_empty() {
         match format {
-            OutputFormat::Json => println!(
-                "{}",
-                serde_json::json!({
+            OutputFormat::Json => {
+                let mut empty = serde_json::json!({
                     "query": query,
                     "index_path": msrch_dir.display().to_string(),
+                    "score_kind": outcome.score_kind.as_str(),
                     "results": []
-                })
-            ),
+                });
+                if !outcome.warnings.is_empty() {
+                    empty["warnings"] = serde_json::json!(outcome.warnings);
+                }
+                println!("{}", empty);
+            }
             _ => println!("No results found."),
         }
         return;
@@ -54,8 +71,8 @@ pub fn render(format: OutputFormat, query: &str, msrch_dir: &Path, results: &[Se
 
     match format {
         OutputFormat::Plain => display_plain(results),
-        OutputFormat::Context => display_context(results),
-        OutputFormat::Json => display_json(query, msrch_dir, results),
+        OutputFormat::Context => display_context(results, outcome.score_kind),
+        OutputFormat::Json => display_json(query, msrch_dir, outcome),
         OutputFormat::Filename => display_filename(results),
     }
 }
@@ -66,8 +83,8 @@ fn display_plain(results: &[SearchResult]) {
     }
 }
 
-fn display_context(results: &[SearchResult]) {
-    println!("{}", format!("Found {} results:", results.len()).bold());
+fn display_context(results: &[SearchResult], kind: ScoreKind) {
+    println!("{}", context_header(results.len(), kind).bold());
     for result in results {
         let context_suffix = if result.context.is_empty() {
             String::new()
@@ -89,8 +106,9 @@ fn display_context(results: &[SearchResult]) {
     }
 }
 
-fn display_json(query: &str, msrch_dir: &Path, results: &[SearchResult]) {
-    let json_results: Vec<JsonResult> = results
+fn display_json(query: &str, msrch_dir: &Path, outcome: &SearchOutcome) {
+    let json_results: Vec<JsonResult> = outcome
+        .results
         .iter()
         .map(|r| JsonResult {
             file_path: r.file_path.clone(),
@@ -104,6 +122,8 @@ fn display_json(query: &str, msrch_dir: &Path, results: &[SearchResult]) {
     let output = JsonOutput {
         query: query.to_string(),
         index_path: msrch_dir.display().to_string(),
+        score_kind: outcome.score_kind.as_str(),
+        warnings: outcome.warnings.clone(),
         results: json_results,
     };
 
@@ -208,6 +228,16 @@ mod tests {
         assert_eq!(
             unique_file_paths(&results),
             vec!["src/a.rs", "src/b.rs", "src/c.rs"]
+        );
+    }
+
+    #[test]
+    fn context_header_marks_reranked_sets() {
+        use msrch_core::search::ScoreKind;
+        assert_eq!(context_header(5, ScoreKind::Vector), "Found 5 results:");
+        assert_eq!(
+            context_header(5, ScoreKind::Reranker),
+            "Found 5 results (reranked):"
         );
     }
 }

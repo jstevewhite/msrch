@@ -45,6 +45,40 @@ impl SearchResult {
     }
 }
 
+/// What the `score` field of each result means for this query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScoreKind {
+    /// Cosine similarity from the vector search (1.0 − distance).
+    Vector,
+    /// Cross-encoder relevance from the reranker (its own scale).
+    Reranker,
+}
+
+impl ScoreKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScoreKind::Vector => "vector",
+            ScoreKind::Reranker => "reranker",
+        }
+    }
+}
+
+/// A search's results plus the metadata front-ends need to present them
+/// honestly: which score scale applies, and any degradations that occurred.
+#[derive(Debug)]
+pub struct SearchOutcome {
+    pub results: Vec<SearchResult>,
+    /// Reranker ONLY when reranking ran and succeeded.
+    pub score_kind: ScoreKind,
+    /// Human-readable degradation notices (front-ends decide the channel).
+    pub warnings: Vec<String>,
+}
+
+/// `Some(flag)` overrides config in either direction; `None` defers to it.
+fn resolved_rerank_enabled(flag: Option<bool>, config_enabled: bool) -> bool {
+    flag.unwrap_or(config_enabled)
+}
+
 /// Options for a search request. Front-ends build this; core executes it.
 /// Designed as a struct so the future MCP front-end can map protocol
 /// requests onto it without signature churn.
@@ -52,8 +86,9 @@ impl SearchResult {
 pub struct SearchOptions {
     /// Max results; `None` uses the config's `default_limit`.
     pub limit: Option<usize>,
-    /// Force reranking on (OR'd with config `reranker.enabled`).
-    pub use_rerank: bool,
+    /// Rerank override: `Some(true)` forces reranking on, `Some(false)`
+    /// forces it off (overriding config), `None` uses `reranker.enabled`.
+    pub rerank: Option<bool>,
     /// Substring match against the stored absolute file path.
     pub path_contains: Option<String>,
     /// Inclusive lower bound on file modification time.
@@ -117,18 +152,12 @@ impl Searcher {
         self.index_root.join(".msrch")
     }
 
-    pub async fn search(
-        &self,
-        query_text: &str,
-        opts: &SearchOptions,
-    ) -> Result<Vec<SearchResult>> {
+    pub async fn search(&self, query_text: &str, opts: &SearchOptions) -> Result<SearchOutcome> {
         let embedder = EmbeddingClient::new(self.config.embedding.clone())?;
 
         // Create reranker config, overriding enabled flag if requested
         let mut reranker_config = self.config.reranker.clone();
-        if opts.use_rerank {
-            reranker_config.enabled = true;
-        }
+        reranker_config.enabled = resolved_rerank_enabled(opts.rerank, reranker_config.enabled);
         let reranker = RerankerClient::new(reranker_config)?;
 
         let db = VectorDB::new(self.msrch_dir().join("index.db")).await?;
@@ -191,55 +220,71 @@ impl Searcher {
             });
         }
 
-        // Rerank the filter survivors (never wastes cross-encoder budget on
-        // hits the date filter would discard), then truncate to limit.
-        if reranker.is_enabled() && !results.is_empty() {
-            debug!("Reranking {} candidates", results.len());
+        let (results, score_kind, warnings) =
+            apply_rerank(&reranker, query_text, results, limit).await;
 
-            // Survivors are vector-score-ordered; rerank only the top_n best,
-            // preserving top_n's contract as the cross-encoder candidate cap
-            // even when date filtering over-fetched.
-            results.truncate(reranker.top_n().max(limit));
+        Ok(SearchOutcome {
+            results: results.iter().map(SearchResult::from_point).collect(),
+            score_kind,
+            warnings,
+        })
+    }
+}
 
-            let documents: Vec<String> = results
-                .iter()
-                .map(|r| {
-                    r.payload
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                })
-                .collect();
+/// Rerank stage: caps candidates at top_n, reranks the survivors, and
+/// truncates to `limit`. Reports which score scale the results carry and any
+/// degradation. Extracted so the fallback path tests without live endpoints.
+async fn apply_rerank(
+    reranker: &RerankerClient,
+    query_text: &str,
+    mut results: Vec<ScoredPoint>,
+    limit: usize,
+) -> (Vec<ScoredPoint>, ScoreKind, Vec<String>) {
+    if reranker.is_enabled() && !results.is_empty() {
+        debug!("Reranking {} candidates", results.len());
 
-            match reranker.rerank(query_text, documents).await {
-                Ok(reranked) => {
-                    debug!("Reranking complete, got {} results", reranked.len());
-                    let mut reranked_results: Vec<ScoredPoint> = reranked
-                        .into_iter()
-                        .filter_map(|(idx, score)| {
-                            results.get(idx).map(|r| ScoredPoint {
-                                id: r.id.clone(),
-                                score, // Use reranker score
-                                payload: r.payload.clone(),
-                            })
+        // Survivors are vector-score-ordered; rerank only the top_n best,
+        // preserving top_n's contract as the cross-encoder candidate cap
+        // even when date filtering over-fetched.
+        results.truncate(reranker.top_n().max(limit));
+
+        let documents: Vec<String> = results
+            .iter()
+            .map(|r| {
+                r.payload
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
+            .collect();
+
+        match reranker.rerank(query_text, documents).await {
+            Ok(reranked) => {
+                debug!("Reranking complete, got {} results", reranked.len());
+                let mut reranked_results: Vec<ScoredPoint> = reranked
+                    .into_iter()
+                    .filter_map(|(idx, score)| {
+                        results.get(idx).map(|r| ScoredPoint {
+                            id: r.id.clone(),
+                            score, // Use reranker score
+                            payload: r.payload.clone(),
                         })
-                        .collect();
-                    reranked_results.truncate(limit);
-                    results = reranked_results;
-                }
-                Err(e) => {
-                    // Stderr on purpose: user-visible degradation notice even
-                    // without a logger initialized (query never inits env_logger).
-                    eprintln!("Reranking failed, using vector scores: {}", e);
-                    results.truncate(limit);
-                }
+                    })
+                    .collect();
+                reranked_results.truncate(limit);
+                (reranked_results, ScoreKind::Reranker, Vec::new())
             }
-        } else {
-            results.truncate(limit);
+            Err(e) => {
+                // Front-ends choose the channel (CLI: stderr; MCP: in-band).
+                let warning = format!("Reranking failed, using vector scores: {}", e);
+                results.truncate(limit);
+                (results, ScoreKind::Vector, vec![warning])
+            }
         }
-
-        Ok(results.iter().map(SearchResult::from_point).collect())
+    } else {
+        results.truncate(limit);
+        (results, ScoreKind::Vector, Vec::new())
     }
 }
 
@@ -319,6 +364,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A vector-scored point for a given file, for tests that only care
+    /// about ordering/count, not score values.
+    fn point(file_path: &str) -> ScoredPoint {
+        ScoredPoint {
+            id: uuid::Uuid::new_v4().to_string(),
+            score: 1.0,
+            payload: json!({ "file_path": file_path }),
+        }
+    }
+
     #[test]
     fn from_point_extracts_payload_fields() {
         let point = ScoredPoint {
@@ -375,7 +430,7 @@ mod tests {
     fn search_options_default_is_all_off() {
         let opts = SearchOptions::default();
         assert!(opts.limit.is_none());
-        assert!(!opts.use_rerank);
+        assert!(opts.rerank.is_none());
         assert!(opts.path_contains.is_none());
         assert!(opts.after.is_none() && opts.before.is_none());
         assert!(opts.min_similarity.is_none());
@@ -417,5 +472,59 @@ mod tests {
         assert_eq!(out[0].file_path, "/repo/a.rs");
         assert_eq!(out[0].score, 0.9);
         assert_eq!(out[1].file_path, "/repo/b.rs");
+    }
+
+    #[test]
+    fn rerank_resolution_table() {
+        // flag × config → resolved enabled
+        for (flag, config_enabled, expect) in [
+            (None, false, false),
+            (None, true, true),
+            (Some(true), false, true),
+            (Some(true), true, true),
+            (Some(false), false, false),
+            (Some(false), true, false), // force-off overrides config — the new capability
+        ] {
+            assert_eq!(
+                resolved_rerank_enabled(flag, config_enabled),
+                expect,
+                "flag={flag:?} config={config_enabled}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_rerank_disabled_reports_vector_and_no_warnings() {
+        let reranker = RerankerClient::new(crate::config::RerankerConfig {
+            enabled: false,
+            ..crate::config::RerankerConfig::default()
+        })
+        .unwrap();
+        let points = vec![point("a.rs"), point("b.rs"), point("c.rs")];
+        let (results, kind, warnings) = apply_rerank(&reranker, "q", points, 2).await;
+        assert_eq!(kind, ScoreKind::Vector);
+        assert!(warnings.is_empty());
+        assert_eq!(results.len(), 2, "truncated to limit");
+    }
+
+    #[tokio::test]
+    async fn apply_rerank_fallback_reports_vector_and_warning() {
+        // Dead endpoint: enabled reranker fails instantly, hermetically.
+        let reranker = RerankerClient::new(crate::config::RerankerConfig {
+            enabled: true,
+            endpoint: "http://127.0.0.1:1/rerank".to_string(),
+            ..crate::config::RerankerConfig::default()
+        })
+        .unwrap();
+        let points = vec![point("a.rs"), point("b.rs"), point("c.rs")];
+        let (results, kind, warnings) = apply_rerank(&reranker, "q", points, 2).await;
+        assert_eq!(kind, ScoreKind::Vector, "fallback is vector-scored");
+        assert_eq!(warnings.len(), 1);
+        assert!(
+            warnings[0].starts_with("Reranking failed, using vector scores:"),
+            "byte-compatible warning text: {}",
+            warnings[0]
+        );
+        assert_eq!(results.len(), 2, "fallback still truncates to limit");
     }
 }

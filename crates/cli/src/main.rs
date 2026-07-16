@@ -211,17 +211,20 @@ async fn main() -> anyhow::Result<()> {
                 .context("Initialization failed")?;
             let opts = search::SearchOptions {
                 limit: *limit,
-                use_rerank: *rerank,
+                rerank: (*rerank).then_some(true), // Task 2 makes this tri-state
                 min_similarity: *min_similarity,
                 path_contains: path.clone(),
                 after: *after,
                 before: *before,
             };
-            let results = searcher
+            let outcome = searcher
                 .search(text, &opts)
                 .await
                 .context("Search failed")?;
-            output::render(*format, text, &searcher.msrch_dir(), &results);
+            for warning in &outcome.warnings {
+                eprintln!("{warning}"); // e.g. "Reranking failed, using vector scores: ..."
+            }
+            output::render(*format, text, &searcher.msrch_dir(), &outcome);
         }
         Commands::Reindex => {
             let current_dir = std::env::current_dir()?;

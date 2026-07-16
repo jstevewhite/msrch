@@ -72,7 +72,7 @@ pub struct SearchArgs {
     pub index: Option<String>,
     /// Max results (default: the index's configured default_limit).
     pub limit: Option<usize>,
-    /// Cross-encoder rerank for precision (slower).
+    /// Rerank override: true forces on, false forces off, omitted uses the index's config.
     pub rerank: Option<bool>,
     /// Minimum vector similarity, 0.0-1.0.
     pub min_similarity: Option<f32>,
@@ -242,18 +242,19 @@ impl MsrchServer {
             .map_err(|e| ToolError::Internal(format!("{e:#}")))?;
         let opts = msrch_core::search::SearchOptions {
             limit: args.limit,
-            use_rerank: args.rerank.unwrap_or(false),
+            rerank: args.rerank,
             min_similarity: args.min_similarity,
             path_contains: args.path_contains.clone(),
             after,
             before,
         };
-        let results = searcher
+        let outcome = searcher
             .search(&args.query, &opts)
             .await
             .map_err(|e| ToolError::Internal(format!("{e:#}")))?;
 
-        let json_results: Vec<serde_json::Value> = results
+        let json_results: Vec<serde_json::Value> = outcome
+            .results
             .iter()
             .map(|r| {
                 serde_json::json!({
