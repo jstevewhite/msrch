@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 arrow.workspace = true
-confy.workspace = true
 dom_smoothie.workspace = true
 ego-tree.workspace = true
 futures.workspace = true

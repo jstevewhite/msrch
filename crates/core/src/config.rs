@@ -1,5 +1,7 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
@@ -167,11 +169,95 @@ impl Default for RerankerConfig {
     }
 }
 
+/// Global config path: `$XDG_CONFIG_HOME/msrch/config.toml` when set and
+/// non-empty, else `$HOME/.config/msrch/config.toml`. Pure for testability.
+fn resolve_global_config_path(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(xdg) = xdg
+        && !xdg.is_empty()
+    {
+        return Some(PathBuf::from(xdg).join("msrch").join("config.toml"));
+    }
+    home.map(|h| {
+        PathBuf::from(h)
+            .join(".config")
+            .join("msrch")
+            .join("config.toml")
+    })
+}
+
+/// Where confy (pre-0.5.0) kept the global config on macOS. On Linux the
+/// confy path coincides with the new path, so this only ever exists on macOS.
+fn legacy_global_config_path(home: Option<&OsStr>) -> Option<PathBuf> {
+    home.map(|h| {
+        PathBuf::from(h)
+            .join("Library/Application Support/rs.msrch")
+            .join("config.toml")
+    })
+}
+
+/// Copy-once migration from the legacy confy location. Returns the path this
+/// run should read. Never modifies or removes the legacy file; every failure
+/// degrades to reading the legacy path directly.
+fn migrate_legacy_config(new_path: &Path, legacy_path: &Path) -> PathBuf {
+    if new_path.exists() || !legacy_path.exists() {
+        return new_path.to_path_buf();
+    }
+    if let Some(dir) = new_path.parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        eprintln!(
+            "warning: could not create {} ({e}); reading legacy config at {}",
+            dir.display(),
+            legacy_path.display()
+        );
+        return legacy_path.to_path_buf();
+    }
+    match std::fs::copy(legacy_path, new_path) {
+        Ok(_) => {
+            eprintln!(
+                "migrated global config to {} (old file left in place at {})",
+                new_path.display(),
+                legacy_path.display()
+            );
+            new_path.to_path_buf()
+        }
+        Err(e) => {
+            eprintln!(
+                "warning: could not migrate global config to {} ({e}); reading {}",
+                new_path.display(),
+                legacy_path.display()
+            );
+            legacy_path.to_path_buf()
+        }
+    }
+}
+
 impl Config {
-    pub fn load_global_config() -> Result<Self, confy::ConfyError> {
-        // This will load from OS specific config dir, e.g. ~/.config/msrch/msrch.toml or similar
-        // We use "msrch" as app name, and "config" as the file name if we can control it, or just "msrch"
-        confy::load("msrch", "config")
+    /// Load the global config from `~/.config/msrch/config.toml` (XDG-aware),
+    /// after a one-time copy migration from the legacy confy location.
+    /// A missing file yields defaults; unlike confy, no file is auto-created.
+    pub fn load_global_config() -> anyhow::Result<Self> {
+        let xdg = std::env::var_os("XDG_CONFIG_HOME");
+        let home = std::env::var_os("HOME");
+        let new_path = resolve_global_config_path(xdg.as_deref(), home.as_deref())
+            .context("cannot determine home directory for global config")?;
+        let read_path = match legacy_global_config_path(home.as_deref()) {
+            Some(legacy) => migrate_legacy_config(&new_path, &legacy),
+            None => new_path,
+        };
+        Self::load_global_config_from(&read_path)
+    }
+
+    /// Read a global config file: absent → defaults; malformed → Err (the
+    /// caller `load_global_config_or_default` turns that into warn+defaults).
+    fn load_global_config_from(path: &Path) -> anyhow::Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("failed to read global config at {}", path.display()))?;
+        toml::from_str(&text)
+            .with_context(|| format!("failed to parse global config at {}", path.display()))
     }
 
     /// Load the global config, falling back to defaults with a warning if the file
@@ -371,6 +457,98 @@ model = "project-model"
         assert!(!QueryConfig::default().auto_index);
         let config: Config = toml::from_str("[query]\nauto_index = true\n").unwrap();
         assert!(config.query.auto_index);
+    }
+
+    #[test]
+    fn resolve_global_config_path_prefers_nonempty_xdg() {
+        use std::ffi::OsStr;
+        assert_eq!(
+            resolve_global_config_path(Some(OsStr::new("/xdg")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/xdg/msrch/config.toml"))
+        );
+        // Empty XDG_CONFIG_HOME is treated as unset (XDG spec):
+        assert_eq!(
+            resolve_global_config_path(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/msrch/config.toml"))
+        );
+        assert_eq!(
+            resolve_global_config_path(None, Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/msrch/config.toml"))
+        );
+        assert_eq!(resolve_global_config_path(None, None), None);
+    }
+
+    #[test]
+    fn migrate_legacy_config_copies_once_and_prefers_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_path = dir.path().join("new/config.toml");
+        let legacy = dir.path().join("legacy/config.toml");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "[query]\ndefault_limit = 3\n").unwrap();
+
+        // Legacy exists, new absent → copy happens, new path returned, legacy intact.
+        let read = migrate_legacy_config(&new_path, &legacy);
+        assert_eq!(read, new_path);
+        assert_eq!(
+            std::fs::read_to_string(&new_path).unwrap(),
+            "[query]\ndefault_limit = 3\n"
+        );
+        assert!(legacy.exists(), "legacy file must never be removed");
+
+        // New exists → no re-copy, even when contents differ.
+        std::fs::write(&new_path, "[query]\ndefault_limit = 9\n").unwrap();
+        let read = migrate_legacy_config(&new_path, &legacy);
+        assert_eq!(read, new_path);
+        assert_eq!(
+            std::fs::read_to_string(&new_path).unwrap(),
+            "[query]\ndefault_limit = 9\n",
+            "existing new-path config must not be overwritten"
+        );
+
+        // Legacy absent → new path returned untouched.
+        let lonely = dir.path().join("lonely/config.toml");
+        assert_eq!(
+            migrate_legacy_config(&lonely, &dir.path().join("nope.toml")),
+            lonely
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_config_copy_failure_falls_back_to_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy.toml");
+        std::fs::write(&legacy, "[query]\ndefault_limit = 3\n").unwrap();
+        // Make the new path's parent an ordinary FILE so create_dir_all fails.
+        let blocker = dir.path().join("blocker");
+        std::fs::write(&blocker, b"file, not dir").unwrap();
+        let new_path = blocker.join("config.toml");
+
+        let read = migrate_legacy_config(&new_path, &legacy);
+        assert_eq!(
+            read, legacy,
+            "copy failure must fall back to reading legacy"
+        );
+        assert!(legacy.exists());
+    }
+
+    #[test]
+    fn load_global_config_from_reads_missing_as_default_and_file_as_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let absent = dir.path().join("nope.toml");
+        let config = Config::load_global_config_from(&absent).unwrap();
+        assert_eq!(
+            config.query.default_limit,
+            Config::default().query.default_limit
+        );
+
+        let present = dir.path().join("config.toml");
+        std::fs::write(&present, "[query]\ndefault_limit = 4\n").unwrap();
+        let config = Config::load_global_config_from(&present).unwrap();
+        assert_eq!(config.query.default_limit, 4);
+
+        let malformed = dir.path().join("bad.toml");
+        std::fs::write(&malformed, "not [valid").unwrap();
+        assert!(Config::load_global_config_from(&malformed).is_err());
     }
 
     #[test]
