@@ -162,11 +162,16 @@ msrch "error handling" --limit 5
 # JSON output for scripting
 msrch "database" --format json | jq -r '.results[].file_path'
 
+JSON output includes score_kind ("vector" cosine similarity, or "reranker" cross-encoder relevance — a different scale) and a warnings array when a degradation occurred (e.g. reranker unreachable).
+
 # Deduplicated file paths only (grep -l style), for piping into other tools
 msrch "database" --format filename
 
 # Use reranker for better precision (slower)
 msrch "auth logic" --rerank
+
+# Force reranking OFF even where config enables it
+msrch "auth logic" --no-rerank
 
 # Skip auto-index for this query (overrides query.auto_index in config)
 msrch "quick search" --no-auto-index
@@ -203,7 +208,7 @@ msrch config
 
 Configuration is loaded in this priority order:
 
-1. CLI flags (`--limit`, `--format`, `--min-similarity`, `--rerank`, `--path`, `--after`/`--before`, `--no-auto-index`)
+1. CLI flags (`--limit`, `--format`, `--min-similarity`, `--rerank`, `--no-rerank`, `--path`, `--after`/`--before`, `--no-auto-index`)
 2. Project config: `.msrch/config.toml` in the index root (overlaid field-by-field)
 3. Global user config: `~/.config/msrch/config.toml` (`$XDG_CONFIG_HOME/msrch/config.toml` when set)
 4. Built-in defaults

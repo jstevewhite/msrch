@@ -246,8 +246,8 @@ impl MsrchServer {
     }
 
     /// Config-gated, race-locked, non-fatal freshness pass. Returns the
-    /// refreshed-file count and any degradation warnings (also mirrored to
-    /// the server's stderr for operator visibility).
+    /// refreshed-file count and any degradation warnings (the failure case is
+    /// also mirrored to the server's stderr for operator visibility).
     pub(crate) async fn run_auto_index(
         &self,
         entry: &IndexEntry,

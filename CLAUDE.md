@@ -62,14 +62,14 @@ cargo run -- query "search query" --path docs/ --after 7d
 2. **Query Embedding** - Embeds search text using same model as indexing
 3. **Vector Search** - LanceDB flat similarity search (cosine distance converted to similarity: `1.0 - distance`)
 4. **Optional Reranking** (`reranker.rs`) - Cross-encoder reranking for precision (slower but more accurate)
-5. **Result Formatting** - Plain/Context/JSON output modes
+5. **Result Formatting** - Plain/Context/JSON output modes; results carry score_kind + degradation warnings
 
 ### Key Modules
 
 - **`main.rs`** - CLI parsing with clap, command dispatch, implicit query support (`msrch "text"`)
 - **`config.rs`** - Configuration types and loading: XDG-aware global config (one-time migration from the legacy confy location) + project-level overlays
 - **`index.rs`** - Indexing orchestration, incremental updates, manifest management
-- **`search.rs`** - Query execution, index discovery (walk-up pattern), output formatting; `SearchOptions` request struct (path/date filters)
+- **`search.rs`** - Query execution, index discovery (walk-up pattern), output formatting; `SearchOptions` request struct (path/date filters); returns SearchOutcome (results + score_kind + warnings)
 - **`db.rs`** - LanceDB wrapper using Arrow RecordBatch for bulk operations
 - **`embedding.rs`** - HTTP client for OpenAI-compatible embedding endpoints
 - **`reranker.rs`** - HTTP client for reranking endpoints

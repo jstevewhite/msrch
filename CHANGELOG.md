@@ -5,6 +5,23 @@ or index-compatibility changes, **patch** for fixes. Every release is a git tag
 (`vX.Y.Z`); `msrch --version` prints the semver, index schema version, and the
 commit the binary was built from.
 
+## [0.7.0] - 2026-07-16
+
+### Added
+- **score_kind** on search results (CLI JSON and MCP): `"vector"` (cosine
+  similarity) or `"reranker"` (cross-encoder relevance, its own scale) — set
+  to reranker only when reranking actually ran and succeeded. The context
+  format's header now reads `Found N results (reranked):` for reranked sets.
+- **warnings** array (CLI JSON and MCP responses): in-band degradation
+  notices — reranker fallback, auto-index failure, and auto-index skipped
+  because a refresh was already in flight. Previously these were visible only
+  on the server/CLI stderr, invisible to MCP clients.
+- `--no-rerank` (CLI) and true tri-state `rerank` (MCP): `false` now forces
+  reranking OFF even where config enables it; omitted defers to config.
+  Previously the flag could only force it on.
+
+No index schema change — existing indexes work as-is.
+
 ## [0.6.0] - 2026-07-16
 
 ### Added

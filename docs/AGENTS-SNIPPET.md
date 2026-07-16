@@ -31,6 +31,9 @@ Notes:
 - If this repo's `.msrch/config.toml` sets `query.auto_index = true`, results
   are always fresh; otherwise run `msrch index .` after big changes.
 - `--rerank` trades speed for precision when the top hits look off.
+- Results carry `score_kind`: `reranker` scores use the cross-encoder's own
+  scale (often ≪1) — don't compare them to `vector` cosine scores. Pass
+  `rerank: false` (MCP) / `--no-rerank` (CLI) to force cosine scoring.
 - If your agent supports MCP, `msrch mcp` in this repo's MCP config exposes
   the same search as a `search` tool — otherwise the shell commands above
   are the interface.
