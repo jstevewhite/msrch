@@ -33,7 +33,8 @@ impl IndexRegistry {
                     (name, flag.clone())
                 }
             };
-            let root = PathBuf::from(&raw_path);
+            let root = std::path::absolute(&raw_path)
+                .with_context(|| format!("cannot absolutize index root '{raw_path}'"))?;
             if !root.is_dir() {
                 bail!("index root '{raw_path}' does not exist");
             }
@@ -180,5 +181,41 @@ mod tests {
                 && format!("{err:#}").contains("alpha"),
             "unknown name lists valid ones: {err:#}"
         );
+    }
+
+    #[test]
+    fn from_flags_absolutizes_relative_paths() {
+        let cwd = std::env::current_dir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let root = make_index_root(&dir, "rel");
+        let relative = pathdiff_lite(&root, &cwd);
+
+        // Verify the relative path actually resolves to a real index root before testing.
+        assert!(
+            std::fs::metadata(&relative).is_ok(),
+            "relative path construction failed; cannot construct path from {:?} to {:?}",
+            cwd,
+            root
+        );
+
+        let reg = IndexRegistry::from_flags(&[relative.display().to_string()]).unwrap();
+        assert!(
+            reg.entries()[0].root.is_absolute(),
+            "registry roots must be absolute, got {}",
+            reg.entries()[0].root.display()
+        );
+    }
+
+    /// Minimal relative-path construction for the test: walk up from `base`
+    /// then down to `target` (both absolute).
+    fn pathdiff_lite(target: &std::path::Path, base: &std::path::Path) -> std::path::PathBuf {
+        let mut result = std::path::PathBuf::new();
+        for _ in base.components().skip(1) {
+            result.push("..");
+        }
+        for comp in target.components().skip(1) {
+            result.push(comp);
+        }
+        result
     }
 }
