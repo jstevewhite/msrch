@@ -122,7 +122,7 @@ Implementation is in `search.rs::find_index_root()`.
 ### Config Loading
 - Global: `Config::load_global_config()` uses `confy` crate (OS-specific config dir)
 - Project: merged via Config::load_for_index(index_root) — global config overlaid with .msrch/config.toml (project wins field-by-field; malformed project file warns and is ignored)
-- Note: retries and `max_file_size_mb` are pending implementation
+- Note: retries are pending implementation; `max_file_size_mb` is enforced for extractable document types only (see extract.rs)
 
 ## Versioning & Releases
 

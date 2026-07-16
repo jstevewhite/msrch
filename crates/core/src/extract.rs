@@ -265,6 +265,9 @@ fn docx_xml_to_markdown(xml: &str) -> String {
                         out.push_str("\n\n");
                     }
                 }
+                b"p" if in_row && !para.is_empty() && !para.ends_with(char::is_whitespace) => {
+                    para.push(' ');
+                }
                 b"tbl" => tbl_depth = tbl_depth.saturating_sub(1),
                 b"tc" if tbl_depth == 1 => {
                     let cell = para.trim();
@@ -447,7 +450,7 @@ mod tests {
             .unwrap()
             .expect("article page must extract");
         // dom_smoothie strips an h1 that duplicates the page title, so
-        // readability_markdown re-injects the title as a `#` heading.
+        // extract_html re-injects the title as a `#` heading.
         assert!(text.contains("# Quarterly Report"), "article heading kept: {text}");
         assert!(text.contains("## Highlights"), "article subheading kept: {text}");
         assert!(text.contains("workspace refactor"), "body kept");
@@ -623,8 +626,28 @@ mod tests {
         // Outer row stays one line containing both outer cells (inner content flattens into the first cell).
         let row_line = text.lines().find(|l| l.contains("outer-a")).expect("row line exists");
         assert!(row_line.contains("outer-b"), "outer cells on one row line: {text}");
-        assert!(text.contains("inner"), "nested content not lost: {text}");
+        assert!(text.contains("outer-a inner"), "nested content separated from cell text: {text}");
         assert!(text.contains("after table"), "post-table paragraph intact: {text}");
+    }
+
+    #[test]
+    fn docx_multi_paragraph_cell_does_not_glue_words() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = r#"<?xml version="1.0"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+ <w:body>
+  <w:tbl>
+   <w:tr>
+    <w:tc><w:p><w:r><w:t>Line one</w:t></w:r></w:p><w:p><w:r><w:t>Line two</w:t></w:r></w:p></w:tc>
+    <w:tc><w:p><w:r><w:t>other cell</w:t></w:r></w:p></w:tc>
+   </w:tr>
+  </w:tbl>
+ </w:body>
+</w:document>"#;
+        let p = write_docx(&dir, "multi-para-cell.docx", xml);
+        let text = extract(&p, u64::MAX).unwrap().expect("must extract");
+        assert!(text.contains("Line one Line two"), "cell paragraphs separated: {text}");
+        assert!(text.contains("Line one Line two | other cell"), "row intact: {text}");
     }
 
     #[test]
