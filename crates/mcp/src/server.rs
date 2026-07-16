@@ -55,14 +55,6 @@ impl ToolError {
     }
 }
 
-/// Bare-string errors from within the impl layer (arg validation, date
-/// parsing, registry resolution) are always client-caused.
-impl From<String> for ToolError {
-    fn from(msg: String) -> Self {
-        ToolError::InvalidParams(msg)
-    }
-}
-
 impl From<ToolError> for McpError {
     fn from(e: ToolError) -> Self {
         match e {
@@ -98,26 +90,40 @@ pub struct StatsArgs {
     pub index: Option<String>,
 }
 
+/// State shared by every MsrchServer instance (HTTP sessions each build
+/// their own server; the registry and per-root auto-index locks must be
+/// process-wide).
+pub(crate) struct SharedState {
+    pub(crate) registry: IndexRegistry,
+    /// One lock per registered root, keyed by index name. Guards the
+    /// auto-index write path only; searches never block on it.
+    pub(crate) auto_index_locks: std::collections::HashMap<String, tokio::sync::Mutex<()>>,
+}
+
 #[derive(Clone)]
 pub struct MsrchServer {
-    registry: Arc<IndexRegistry>,
+    state: Arc<SharedState>,
     tool_router: ToolRouter<Self>,
 }
 
 impl MsrchServer {
-    pub fn new(registry: Arc<IndexRegistry>) -> Self {
+    pub(crate) fn new(state: Arc<SharedState>) -> Self {
         Self {
-            registry,
+            state,
             tool_router: Self::tool_router(),
         }
     }
 
     fn resolve(&self, index: Option<&str>) -> Result<&IndexEntry, String> {
-        self.registry.resolve(index).map_err(|e| format!("{e:#}"))
+        self.state
+            .registry
+            .resolve(index)
+            .map_err(|e| format!("{e:#}"))
     }
 
     pub(crate) fn list_indexes_impl(&self) -> Result<serde_json::Value, ToolError> {
         let list: Vec<serde_json::Value> = self
+            .state
             .registry
             .entries()
             .iter()
@@ -139,7 +145,19 @@ impl MsrchServer {
         &self,
         index: Option<String>,
     ) -> Result<serde_json::Value, ToolError> {
-        let entry = self.resolve(index.as_deref())?;
+        let entry = self
+            .resolve(index.as_deref())
+            .map_err(ToolError::InvalidParams)?;
+        if let Some(v) = msrch_core::index::manifest_schema_version(&entry.root)
+            && v != msrch_core::index::SCHEMA_VERSION
+        {
+            return Err(ToolError::Internal(format!(
+                "index '{}' has schema v{v} but this msrch expects v{}; run 'msrch index .' in {} to migrate",
+                entry.name,
+                msrch_core::index::SCHEMA_VERSION,
+                entry.root.display()
+            )));
+        }
         let stats = msrch_core::index::get_stats(&entry.root)
             .await
             .map_err(|e| ToolError::Internal(format!("{e:#}")))?;
@@ -176,18 +194,39 @@ impl MsrchServer {
             .after
             .as_deref()
             .map(msrch_core::dates::parse_date_arg)
-            .transpose()?;
+            .transpose()
+            .map_err(ToolError::InvalidParams)?;
         let before = args
             .before
             .as_deref()
             .map(msrch_core::dates::parse_date_arg)
-            .transpose()?;
-        let entry = self.resolve(args.index.as_deref())?;
+            .transpose()
+            .map_err(ToolError::InvalidParams)?;
+        let entry = self
+            .resolve(args.index.as_deref())
+            .map_err(ToolError::InvalidParams)?;
+        if let Some(v) = msrch_core::index::manifest_schema_version(&entry.root)
+            && v != msrch_core::index::SCHEMA_VERSION
+        {
+            return Err(ToolError::Internal(format!(
+                "index '{}' has schema v{v} but this msrch expects v{}; run 'msrch index .' in {} to migrate",
+                entry.name,
+                msrch_core::index::SCHEMA_VERSION,
+                entry.root.display()
+            )));
+        }
 
         // Same quiet, non-fatal, schema-guarded freshness as the CLI.
         let config = msrch_core::config::Config::load_for_index(&entry.root);
         let mut refreshed = 0usize;
-        if config.query.auto_index {
+        // Locks are built from the registry, so `get` always finds an entry
+        // for a resolved index; if `try_lock` fails, another request is
+        // already refreshing this root — the quiet/non-fatal contract says
+        // search what exists now rather than wait.
+        if config.query.auto_index
+            && let Some(lock) = self.state.auto_index_locks.get(&entry.name)
+            && let Ok(_guard) = lock.try_lock()
+        {
             let indexer = msrch_core::index::Indexer::new(entry.root.clone(), config.clone());
             match indexer.index_quiet().await {
                 Ok(n) => refreshed = n,
@@ -281,6 +320,7 @@ impl MsrchServer {
 impl ServerHandler for MsrchServer {
     fn get_info(&self) -> ServerInfo {
         let names: Vec<&str> = self
+            .state
             .registry
             .entries()
             .iter()
@@ -304,11 +344,19 @@ pub async fn serve(options: McpOptions) -> Result<()> {
     } else {
         IndexRegistry::from_flags(&options.index_flags)?
     };
-    let registry = Arc::new(registry);
+    let auto_index_locks = registry
+        .entries()
+        .iter()
+        .map(|e| (e.name.clone(), tokio::sync::Mutex::new(())))
+        .collect();
+    let state = Arc::new(SharedState {
+        registry,
+        auto_index_locks,
+    });
 
     match options.transport {
         TransportKind::Stdio => {
-            let service = MsrchServer::new(registry).serve(stdio()).await?;
+            let service = MsrchServer::new(state).serve(stdio()).await?;
             service.waiting().await?;
         }
         TransportKind::Http => {
@@ -317,7 +365,7 @@ pub async fn serve(options: McpOptions) -> Result<()> {
             };
             let bind = options.bind.as_deref().unwrap_or(DEFAULT_BIND).to_string();
             let service = StreamableHttpService::new(
-                move || Ok(MsrchServer::new(registry.clone())),
+                move || Ok(MsrchServer::new(state.clone())),
                 LocalSessionManager::default().into(),
                 Default::default(),
             );
@@ -352,7 +400,16 @@ mod tests {
             flags.push(format!("{name}={}", root.display()));
         }
         let reg = IndexRegistry::from_flags(&flags).unwrap();
-        (dir, MsrchServer::new(Arc::new(reg)))
+        let auto_index_locks = reg
+            .entries()
+            .iter()
+            .map(|e| (e.name.clone(), tokio::sync::Mutex::new(())))
+            .collect();
+        let state = Arc::new(SharedState {
+            registry: reg,
+            auto_index_locks,
+        });
+        (dir, MsrchServer::new(state))
     }
 
     #[tokio::test]
@@ -462,5 +519,120 @@ mod tests {
             matches!(err, ToolError::Internal(_)),
             "backend outage must be Internal, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn search_rejects_stale_schema_before_any_io() {
+        let (dir, server) = fixture_server(&["alpha"]);
+        // Downgrade the manifest below SCHEMA_VERSION and point the endpoint
+        // at a dead address — the schema check must fire before any network
+        // I/O, so a stale manifest never gets this far.
+        std::fs::write(
+            dir.path().join("alpha/.msrch/manifest.json"),
+            r#"{"version":4,"files":{"/a.md":{"modified_at":{"secs_since_epoch":100,"nanos_since_epoch":0},"chunk_ids":[]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("alpha/.msrch/config.toml"),
+            "[embedding]\nendpoint = \"http://127.0.0.1:1/embeddings\"\n",
+        )
+        .unwrap();
+        let err = server
+            .search_impl(SearchArgs {
+                query: "q".into(),
+                index: None,
+                limit: None,
+                rerank: None,
+                min_similarity: None,
+                path_contains: None,
+                after: None,
+                before: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ToolError::Internal(_)),
+            "stale schema is a server-side migration need, not a client fault: got {err:?}"
+        );
+        assert!(err.message().contains("run 'msrch index .'"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn stats_rejects_stale_schema() {
+        let (dir, server) = fixture_server(&["alpha"]);
+        std::fs::write(
+            dir.path().join("alpha/.msrch/manifest.json"),
+            r#"{"version":4,"files":{"/a.md":{"modified_at":{"secs_since_epoch":100,"nanos_since_epoch":0},"chunk_ids":[]}}}"#,
+        )
+        .unwrap();
+        let err = server.stats_impl(Some("alpha".into())).await.unwrap_err();
+        assert!(
+            matches!(err, ToolError::Internal(_)),
+            "stale schema is a server-side migration need, not a client fault: got {err:?}"
+        );
+        assert!(err.message().contains("run 'msrch index .'"), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn auto_index_lock_skips_when_held() {
+        let (dir, server) = fixture_server(&["alpha"]);
+        // Enable auto-index and point the root's own config at a dead
+        // endpoint, matching the existing backend-failure test's pattern.
+        std::fs::write(
+            dir.path().join("alpha/.msrch/config.toml"),
+            "[query]\nauto_index = true\n[embedding]\nendpoint = \"http://127.0.0.1:1/embeddings\"\n",
+        )
+        .unwrap();
+        let manifest_path = dir.path().join("alpha/.msrch/manifest.json");
+        let mtime_before = std::fs::metadata(&manifest_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        // Simulate a concurrent request already refreshing this root.
+        let _held = server
+            .state
+            .auto_index_locks
+            .get("alpha")
+            .unwrap()
+            .try_lock()
+            .unwrap();
+
+        let err = server
+            .search_impl(SearchArgs {
+                query: "q".into(),
+                index: None,
+                limit: None,
+                rerank: None,
+                min_similarity: None,
+                path_contains: None,
+                after: None,
+                before: None,
+            })
+            .await
+            .unwrap_err();
+        // Auto-index is skipped (lock held), so search falls through to the
+        // query embedding call, which hits the same dead endpoint.
+        assert!(
+            matches!(err, ToolError::Internal(_)),
+            "with the lock held, search should still reach the dead embedding backend: got {err:?}"
+        );
+        let mtime_after = std::fs::metadata(&manifest_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "auto-index must not have touched the manifest while the lock was held"
+        );
+    }
+
+    #[test]
+    fn shared_state_is_shared_across_server_clones() {
+        let (_dir, server) = fixture_server(&["alpha"]);
+        let state = server.state.clone();
+        let a = MsrchServer::new(state.clone());
+        let b = MsrchServer::new(state.clone());
+        assert!(Arc::ptr_eq(&a.state, &b.state));
     }
 }

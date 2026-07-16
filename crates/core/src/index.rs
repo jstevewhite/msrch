@@ -161,6 +161,16 @@ pub fn load_file_mtimes(index_root: &Path) -> Result<HashMap<PathBuf, SystemTime
         .collect())
 }
 
+/// Schema version recorded in the index manifest, if one exists and is
+/// readable. `None` means "no manifest" (never indexed, or unreadable) —
+/// callers should let downstream operations surface their own errors.
+pub fn manifest_schema_version(index_root: &Path) -> Option<u32> {
+    let path = index_root.join(".msrch").join("manifest.json");
+    let file = std::fs::File::open(path).ok()?;
+    let manifest: Manifest = serde_json::from_reader(file).ok()?;
+    Some(manifest.version)
+}
+
 /// Remove the index artifacts (`index.db/`, `manifest.json`) from an index
 /// root, preserving everything else in `.msrch` — notably `config.toml`.
 pub fn remove_index_artifacts(index_root: &Path) -> Result<()> {
@@ -641,6 +651,23 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let err = load_file_mtimes(empty.path()).unwrap_err();
         assert!(format!("{err:#}").contains("manifest"), "{err:#}");
+    }
+
+    #[test]
+    fn manifest_schema_version_reads_version_or_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let msrch_dir = dir.path().join(".msrch");
+        std::fs::create_dir_all(&msrch_dir).unwrap();
+        std::fs::write(
+            msrch_dir.join("manifest.json"),
+            r#"{"version":5,"files":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(manifest_schema_version(dir.path()), Some(5));
+
+        // No manifest at all → None.
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(manifest_schema_version(empty.path()), None);
     }
 
     #[tokio::test]
