@@ -243,6 +243,19 @@ impl Indexer {
             Manifest::default()
         };
 
+        // Quiet (auto-index) mode must never perform a destructive schema
+        // migration silently: bail out before touching anything so the caller
+        // (CLI) can fall back to the existing, intact index. Only applies
+        // when an index actually exists — a never-indexed directory has
+        // nothing to destroy.
+        if quiet && manifest.version != SCHEMA_VERSION && db_path.exists() {
+            anyhow::bail!(
+                "index schema is outdated (v{} vs current v{}); run 'msrch index .' to migrate",
+                manifest.version,
+                SCHEMA_VERSION
+            );
+        }
+
         // Rebuild from scratch if the on-disk schema predates the current version.
         if Self::migrate_if_needed(&db_path, &mut manifest)? && !quiet {
             println!(
@@ -637,6 +650,24 @@ mod tests {
         // No files → no embedding needed → succeeds without network, returns 0.
         let refreshed = indexer.index_quiet().await.unwrap();
         assert_eq!(refreshed, 0);
+    }
+
+    #[tokio::test]
+    async fn index_quiet_refuses_schema_migration_and_preserves_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let msrch_dir = dir.path().join(".msrch");
+        std::fs::create_dir_all(msrch_dir.join("index.db")).unwrap();
+        std::fs::write(msrch_dir.join("index.db").join("data.lance"), b"x").unwrap();
+        // Old-schema manifest (version 0 == pre-versioning / corrupt fallback):
+        std::fs::write(msrch_dir.join("manifest.json"), r#"{"files":{}}"#).unwrap();
+
+        let indexer = Indexer::new(dir.path().to_path_buf(), crate::config::Config::default());
+        let err = indexer.index_quiet().await.unwrap_err();
+        assert!(format!("{err:#}").contains("run 'msrch index .'"), "{err:#}");
+        assert!(
+            msrch_dir.join("index.db").join("data.lance").exists(),
+            "quiet mode must never delete the index"
+        );
     }
 
     #[test]

@@ -160,7 +160,7 @@ async fn main() -> anyhow::Result<()> {
                 let indexer = index::Indexer::new(index_root.clone(), config.clone());
                 match indexer.index_quiet().await {
                     Ok(0) => {}
-                    Ok(n) => println!("auto-index: refreshed {n} file(s)"),
+                    Ok(n) => eprintln!("auto-index: refreshed {n} file(s)"),
                     Err(e) => eprintln!(
                         "warning: auto-index failed ({e}); searching the existing index"
                     ),

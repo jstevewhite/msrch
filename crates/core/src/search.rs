@@ -148,7 +148,7 @@ impl Searcher {
         // Date filters post-filter the hit list, so over-fetch to avoid
         // starving `limit`. Path-only filtering is exact (DB-side predicate).
         let base_fetch = if date_filtering {
-            (limit * 10).max(100)
+            limit.saturating_mul(10).max(100)
         } else {
             limit
         };
