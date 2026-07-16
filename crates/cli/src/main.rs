@@ -7,7 +7,7 @@ use output::OutputFormat;
 use std::path::PathBuf;
 
 /// Version line for `msrch --version`: semver, index schema, and build commit.
-/// e.g. `msrch 0.2.0 (index schema v4, commit a1b2c3d)`
+/// e.g. `msrch 0.3.0 (index schema v5, commit a1b2c3d)`
 fn version_string() -> String {
     format!(
         "{} (index schema v{}, commit {})",

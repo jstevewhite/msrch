@@ -49,10 +49,11 @@ cargo run -- query "search query" --limit 5 --rerank
 
 **Indexing Pipeline:**
 1. **Crawler** (`crawler.rs`) - Walks directory tree, respects `.gitignore`/`.msrchignore`, filters binary files
-2. **Chunker** (`chunker.rs`) - Splits files into token-sized chunks using tiktoken, with overlap for context
-3. **EmbeddingClient** (`embedding.rs`) - Batches chunks and calls OpenAI-compatible embedding API
-4. **VectorDB** (`db.rs`) - Stores embeddings in LanceDB (currently flat/brute-force scan)
-5. **Manifest** (`index.rs`) - Tracks file modification times for incremental reindexing
+2. **Extractor** (`extract.rs`) - Converts HTML/PDF/docx to plain text before chunking (markdown-ish for HTML/docx, prose for PDF); skips graphics-only PDFs and oversize files
+3. **Chunker** (`chunker.rs`) - Splits files into token-sized chunks using tiktoken, with overlap for context
+4. **EmbeddingClient** (`embedding.rs`) - Batches chunks and calls OpenAI-compatible embedding API
+5. **VectorDB** (`db.rs`) - Stores embeddings in LanceDB (currently flat/brute-force scan)
+6. **Manifest** (`index.rs`) - Tracks file modification times for incremental reindexing
 
 **Query Pipeline:**
 1. **Index Discovery** - Walks up directory tree to find `.msrch/` (like git finding `.git/`)
@@ -72,6 +73,7 @@ cargo run -- query "search query" --limit 5 --rerank
 - **`reranker.rs`** - HTTP client for reranking endpoints
 - **`chunker.rs`** - Token-based text chunking with tiktoken
 - **`crawler.rs`** - File discovery with ignore pattern support
+- **`extract.rs`** - Text extraction for document formats (HTML via readability + fallback, text-layer PDF, docx); owns all format knowledge
 
 ### Vector Database (LanceDB)
 
@@ -241,25 +243,38 @@ use crate::config::Config;
 
 ```
 msrch/
-├── src/
-│   ├── main.rs          # CLI entry point, command dispatch
-│   ├── config.rs        # Configuration types and loading
-│   ├── index.rs         # Indexing orchestration
-│   ├── search.rs        # Query execution and formatting
-│   ├── db.rs            # LanceDB vector database wrapper
-│   ├── embedding.rs     # Embedding API client
-│   ├── reranker.rs      # Reranking API client
-│   ├── chunker.rs       # Text chunking with tiktoken
-│   └── crawler.rs       # File discovery and filtering
-├── Cargo.toml           # Dependencies and metadata
-├── Makefile             # Build shortcuts
-├── README.md            # User documentation
-├── AGENTS.md            # Coding guidelines for AI agents
-├── msrch_HLD.md         # Detailed architecture design doc
-└── .msrch/              # Example index (created by `msrch index .`)
-    ├── index.db/        # LanceDB storage
-    ├── manifest.json    # File tracking for incremental updates
-    └── config.toml      # Optional project-specific config
+├── crates/
+│   ├── core/
+│   │   ├── src/
+│   │   │   ├── lib.rs               # Core library entry point
+│   │   │   ├── config.rs            # Configuration types and loading
+│   │   │   ├── db.rs                # LanceDB vector database wrapper
+│   │   │   ├── embedding.rs         # Embedding API client
+│   │   │   ├── extract.rs           # Document extraction (HTML/PDF/docx)
+│   │   │   ├── index.rs             # Indexing orchestration
+│   │   │   ├── reranker.rs          # Reranking API client
+│   │   │   ├── search.rs            # Query execution and formatting
+│   │   │   ├── chunker.rs           # Text chunking with tiktoken
+│   │   │   └── crawler.rs           # File discovery and filtering
+│   │   └── Cargo.toml               # Core crate manifest
+│   └── cli/
+│       ├── src/
+│       │   ├── main.rs              # CLI entry point, command dispatch
+│       │   └── output.rs            # Output formatting
+│       ├── build.rs                 # Build script for git hash embedding
+│       └── Cargo.toml               # CLI crate manifest
+├── Cargo.toml                       # Workspace manifest (version source of truth)
+├── Cargo.lock                       # Locked dependency versions
+├── Makefile                         # Build shortcuts
+├── README.md                        # User documentation
+├── CLAUDE.md                        # This file: developer guidance
+├── AGENTS.md                        # Coding guidelines for AI agents
+├── CHANGELOG.md                     # Release history
+├── msrch_HLD.md                     # Detailed architecture design doc
+└── .msrch/                          # Example index (created by `msrch index .`)
+    ├── index.db/                    # LanceDB storage
+    ├── manifest.json                # File tracking for incremental updates
+    └── config.toml                  # Optional project-specific config
 ```
 
 ## References

@@ -5,6 +5,22 @@ or index-compatibility changes, **patch** for fixes. Every release is a git tag
 (`vX.Y.Z`); `msrch --version` prints the semver, index schema version, and the
 commit the binary was built from.
 
+## [0.3.0] - 2026-07-15
+
+### Added
+- **Document extraction**: HTML, text-layer PDF, and .docx files are now
+  indexed. HTML gets readability-style main-content extraction (with automatic
+  whole-page fallback for non-article pages); docx headings map to markdown
+  headings for structure-aware chunking; PDFs index their text layer.
+  Graphics-only PDFs are skipped with a warning — no OCR.
+- `max_file_size_mb` (config, default 10) is now enforced for extractable
+  document types.
+
+### Changed
+- Index schema bumped to v5: `.html` files were previously indexed as raw
+  markup; **run `msrch reindex` after upgrading** to replace tag-soup chunks
+  with extracted text.
+
 ## [0.2.0] - 2026-07-15
 
 ### Changed
