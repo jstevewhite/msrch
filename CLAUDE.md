@@ -14,6 +14,7 @@ cargo build                  # Debug build
 cargo build --release        # Release build
 make build                   # Same as cargo build --release
 cargo run -- <args>          # Run in debug mode with arguments
+cargo run -- mcp             # MCP server (stdio; --transport http for shared)
 make install                 # Install to ~/.cargo/bin
 ```
 
@@ -75,6 +76,7 @@ cargo run -- query "search query" --path docs/ --after 7d
 - **`chunker.rs`** - Token-based text chunking with tiktoken
 - **`crawler.rs`** - File discovery with ignore pattern support
 - **`extract.rs`** - Text extraction for document formats (HTML via readability + fallback, text-layer PDF, docx); owns all format knowledge
+- **`crates/mcp`** - MCP front-end: index registry (named roots), search/stats/list_indexes tools, stdio + streamable-HTTP transports (rmcp)
 
 ### Vector Database (LanceDB)
 
@@ -258,12 +260,18 @@ msrch/
 │   │   │   ├── chunker.rs           # Text chunking with tiktoken
 │   │   │   └── crawler.rs           # File discovery and filtering
 │   │   └── Cargo.toml               # Core crate manifest
-│   └── cli/
+│   ├── cli/
+│   │   ├── src/
+│   │   │   ├── main.rs              # CLI entry point, command dispatch
+│   │   │   └── output.rs            # Output formatting
+│   │   ├── build.rs                 # Build script for git hash embedding
+│   │   └── Cargo.toml               # CLI crate manifest
+│   └── mcp/
 │       ├── src/
-│       │   ├── main.rs              # CLI entry point, command dispatch
-│       │   └── output.rs            # Output formatting
-│       ├── build.rs                 # Build script for git hash embedding
-│       └── Cargo.toml               # CLI crate manifest
+│       │   ├── lib.rs               # MCP server entry point
+│       │   ├── registry.rs          # Index registry and validation
+│       │   └── tools.rs             # search, stats, list_indexes tool handlers
+│       └── Cargo.toml               # MCP crate manifest
 ├── Cargo.toml                       # Workspace manifest (version source of truth)
 ├── Cargo.lock                       # Locked dependency versions
 ├── Makefile                         # Build shortcuts

@@ -5,6 +5,19 @@ or index-compatibility changes, **patch** for fixes. Every release is a git tag
 (`vX.Y.Z`); `msrch --version` prints the semver, index schema version, and the
 commit the binary was built from.
 
+## [0.6.0] - 2026-07-16
+
+### Added
+- **MCP server**: `msrch mcp` serves `search` (full filter set), `stats`, and
+  `list_indexes` over the Model Context Protocol. stdio transport for
+  per-project use (index discovered by walk-up, CLI-style) and streamable
+  HTTP (`--transport http`) for a shared server fronting multiple indexes by
+  name (`--index name=path`, repeatable). Auto-index freshness applies per
+  request where the index's config enables it. Default bind 127.0.0.1:7920;
+  no authentication in v1 — localhost/trusted-network only.
+
+No index schema change — existing indexes work as-is.
+
 ## [0.5.0] - 2026-07-16
 
 ### Added

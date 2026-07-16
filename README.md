@@ -289,6 +289,39 @@ semantic hop with `msrch`, identifier hop with `grep`. See
 [docs/AGENTS-SNIPPET.md](docs/AGENTS-SNIPPET.md) for a copy-paste block to add
 to a repo's AGENTS.md / CLAUDE.md.
 
+## MCP server
+
+`msrch mcp` exposes search over the Model Context Protocol — same core, same
+results as the CLI.
+
+**Per-project (stdio):** add to the repo's `.mcp.json` (Claude Code) or MCP
+client config; the server discovers the index by walking up from its working
+directory, exactly like the CLI:
+
+```json
+{
+  "mcpServers": {
+    "msrch": { "command": "msrch", "args": ["mcp"] }
+  }
+}
+```
+
+**Shared server (HTTP):** one long-running process can front several indexes
+by name:
+
+```bash
+msrch mcp --transport http \
+  --index reports=/data/reports \
+  --index code=/code/msrch \
+  --bind 127.0.0.1:7920      # default; use a tailnet address to share
+```
+
+Tools: `search` (full filter set: `path_contains`, `after`/`before`,
+`min_similarity`, `rerank`), `stats`, `list_indexes`. When several indexes
+are registered, pass `index` by name. Clients never supply filesystem paths.
+There is no authentication in v1 — bind to localhost or a trusted network
+(e.g. tailnet) only.
+
 ## Project Structure
 
 Indexed directories contain:

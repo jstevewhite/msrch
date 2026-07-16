@@ -31,3 +31,6 @@ Notes:
 - If this repo's `.msrch/config.toml` sets `query.auto_index = true`, results
   are always fresh; otherwise run `msrch index .` after big changes.
 - `--rerank` trades speed for precision when the top hits look off.
+- If your agent supports MCP, `msrch mcp` in this repo's MCP config exposes
+  the same search as a `search` tool — otherwise the shell commands above
+  are the interface.
