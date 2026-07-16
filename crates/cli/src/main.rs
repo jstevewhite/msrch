@@ -18,6 +18,18 @@ fn version_string() -> String {
     )
 }
 
+/// clap value parser for `--min-similarity`: a float in 0.0..=1.0.
+fn parse_min_similarity(s: &str) -> Result<f32, String> {
+    let v: f32 = s
+        .parse()
+        .map_err(|_| format!("'{s}' is not a number between 0.0 and 1.0"))?;
+    if (0.0..=1.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("'{s}' is out of range; must be between 0.0 and 1.0"))
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(author, version = version_string(), about, long_about = None)]
 #[command(args_conflicts_with_subcommands = true)]
@@ -43,6 +55,10 @@ struct Cli {
     /// Use reranker for more precise results (slower)
     #[arg(long, global = true)]
     rerank: bool,
+
+    /// Minimum similarity score (0.0-1.0); overrides query.min_similarity
+    #[arg(long, short = 'm', global = true, value_parser = parse_min_similarity)]
+    min_similarity: Option<f32>,
 
     /// Only match files whose path contains this substring
     #[arg(long, global = true)]
@@ -79,6 +95,9 @@ enum Commands {
         /// Use reranker for more precise results (slower)
         #[arg(long)]
         rerank: bool,
+        /// Minimum similarity score (0.0-1.0); overrides query.min_similarity
+        #[arg(long, short = 'm', value_parser = parse_min_similarity)]
+        min_similarity: Option<f32>,
         /// Only match files whose path contains this substring
         #[arg(long)]
         path: Option<String>,
@@ -121,6 +140,7 @@ async fn main() -> anyhow::Result<()> {
                 limit: cli.limit,
                 format: cli.format.unwrap_or_default(),
                 rerank: cli.rerank,
+                min_similarity: cli.min_similarity,
                 path: cli.path.clone(),
                 after: cli.after,
                 before: cli.before,
@@ -147,6 +167,7 @@ async fn main() -> anyhow::Result<()> {
             limit,
             format,
             rerank,
+            min_similarity,
             path,
             after,
             before,
@@ -173,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
             let opts = search::SearchOptions {
                 limit: *limit,
                 use_rerank: *rerank,
+                min_similarity: *min_similarity,
                 path_contains: path.clone(),
                 after: *after,
                 before: *before,
@@ -302,5 +324,29 @@ mod tests {
     fn no_auto_index_flag_parses() {
         let cli = Cli::try_parse_from(["msrch", "q", "--no-auto-index"]).expect("should parse");
         assert!(cli.no_auto_index);
+    }
+
+    #[test]
+    fn min_similarity_flag_parses_in_both_forms_and_validates_range() {
+        let cli = Cli::try_parse_from(["msrch", "q", "-m", "0.7"]).expect("short form parses");
+        assert_eq!(cli.min_similarity, Some(0.7));
+        let cli = Cli::try_parse_from(["msrch", "query", "q", "--min-similarity", "0.0"])
+            .expect("subcommand form parses at lower bound");
+        match cli.command {
+            Some(Commands::Query { min_similarity, .. }) => assert_eq!(min_similarity, Some(0.0)),
+            other => panic!("expected Query, got {other:?}"),
+        }
+        for bad in ["1.5", "abc"] {
+            let err = Cli::try_parse_from(["msrch", "q", "--min-similarity", bad]).unwrap_err();
+            assert!(
+                err.to_string().contains("between 0.0 and 1.0"),
+                "range in message for {bad}: {err}"
+            );
+        }
+        let err = Cli::try_parse_from(["msrch", "q", "--min-similarity", "2.0"]).unwrap_err();
+        assert!(
+            err.to_string().contains("between 0.0 and 1.0"),
+            "range in message for 2.0: {err}"
+        );
     }
 }

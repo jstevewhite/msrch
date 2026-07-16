@@ -60,6 +60,9 @@ pub struct SearchOptions {
     pub after: Option<SystemTime>,
     /// Exclusive upper bound on file modification time.
     pub before: Option<SystemTime>,
+    /// Minimum similarity score (0.0–1.0); `None` uses the config's
+    /// `query.min_similarity`.
+    pub min_similarity: Option<f32>,
 }
 
 /// Escape a string for embedding in a SQL LIKE '...' literal: single quotes
@@ -134,7 +137,9 @@ impl Searcher {
         let query_vector = embedding.first().context("No embedding generated")?.clone();
 
         let limit = opts.limit.unwrap_or(self.config.query.default_limit);
-        let min_score = self.config.query.min_similarity;
+        let min_score = opts
+            .min_similarity
+            .unwrap_or(self.config.query.min_similarity);
 
         // Filtering wired in the date-filter change; path predicate is live now.
         let predicate = opts
@@ -373,6 +378,7 @@ mod tests {
         assert!(!opts.use_rerank);
         assert!(opts.path_contains.is_none());
         assert!(opts.after.is_none() && opts.before.is_none());
+        assert!(opts.min_similarity.is_none());
     }
 
     #[test]
