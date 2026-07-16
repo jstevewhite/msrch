@@ -191,6 +191,11 @@ impl Searcher {
         if reranker.is_enabled() && !results.is_empty() {
             debug!("Reranking {} candidates", results.len());
 
+            // Survivors are vector-score-ordered; rerank only the top_n best,
+            // preserving top_n's contract as the cross-encoder candidate cap
+            // even when date filtering over-fetched.
+            results.truncate(reranker.top_n().max(limit));
+
             let documents: Vec<String> = results
                 .iter()
                 .map(|r| {
