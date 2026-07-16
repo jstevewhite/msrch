@@ -18,7 +18,7 @@ fn version_string() -> String {
     )
 }
 
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(author, version = version_string(), about, long_about = None)]
 #[command(args_conflicts_with_subcommands = true)]
 struct Cli {
@@ -43,9 +43,25 @@ struct Cli {
     /// Use reranker for more precise results (slower)
     #[arg(long, global = true)]
     rerank: bool,
+
+    /// Only match files whose path contains this substring
+    #[arg(long, global = true)]
+    path: Option<String>,
+
+    /// Only match files modified on/after this date (YYYY-MM-DD, or 7d/2w/3m ago)
+    #[arg(long, global = true, value_parser = dates::parse_date_arg)]
+    after: Option<std::time::SystemTime>,
+
+    /// Only match files modified before this date (YYYY-MM-DD, or 7d/2w/3m ago)
+    #[arg(long, global = true, value_parser = dates::parse_date_arg)]
+    before: Option<std::time::SystemTime>,
+
+    /// Skip the automatic index refresh even if query.auto_index is enabled
+    #[arg(long, global = true)]
+    no_auto_index: bool,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Commands {
     /// Create/update index in <path>
     Index {
@@ -63,6 +79,15 @@ enum Commands {
         /// Use reranker for more precise results (slower)
         #[arg(long)]
         rerank: bool,
+        /// Only match files whose path contains this substring
+        #[arg(long)]
+        path: Option<String>,
+        /// Only match files modified on/after this date (YYYY-MM-DD, or 7d/2w/3m ago)
+        #[arg(long, value_parser = dates::parse_date_arg)]
+        after: Option<std::time::SystemTime>,
+        /// Only match files modified before this date (YYYY-MM-DD, or 7d/2w/3m ago)
+        #[arg(long, value_parser = dates::parse_date_arg)]
+        before: Option<std::time::SystemTime>,
     },
     /// Force full rebuild
     Reindex,
@@ -77,6 +102,9 @@ enum Commands {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    // Bind no_auto_index before cli.command is moved (consumed by auto-index wiring)
+    let _no_auto_index = cli.no_auto_index;
 
     // Handle implicit query (msrch "search text" without subcommand)
     let command = match cli.command {
@@ -93,6 +121,9 @@ async fn main() -> anyhow::Result<()> {
                 limit: cli.limit,
                 format: cli.format.unwrap_or_default(),
                 rerank: cli.rerank,
+                path: cli.path.clone(),
+                after: cli.after,
+                before: cli.before,
             }
         }
     };
@@ -116,6 +147,9 @@ async fn main() -> anyhow::Result<()> {
             limit,
             format,
             rerank,
+            path,
+            after,
+            before,
         } => {
             let searcher = search::Searcher::new(None)
                 .await
@@ -123,7 +157,9 @@ async fn main() -> anyhow::Result<()> {
             let opts = search::SearchOptions {
                 limit: *limit,
                 use_rerank: *rerank,
-                ..Default::default()
+                path_contains: path.clone(),
+                after: *after,
+                before: *before,
             };
             let results = searcher
                 .search(text, &opts)
@@ -225,5 +261,30 @@ mod tests {
         // Build hash is best-effort but never empty: real hash or "unknown".
         assert!(!v.contains("commit )"), "commit hash must not be empty: {v}");
         assert!(v.contains("commit "));
+    }
+
+    #[test]
+    fn implicit_query_honors_filter_flags() {
+        let cli = Cli::try_parse_from([
+            "msrch", "budget concerns", "--path", "2026/07", "--after", "2026-07-01",
+        ])
+        .expect("should parse");
+        assert_eq!(cli.path, Some("2026/07".to_string()));
+        assert!(cli.after.is_some());
+        assert!(cli.before.is_none());
+        assert_eq!(cli.query_args, vec!["budget concerns".to_string()]);
+    }
+
+    #[test]
+    fn bad_date_is_a_parse_error_listing_forms() {
+        let err = Cli::try_parse_from(["msrch", "q", "--after", "tomorrow"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("YYYY-MM-DD"), "clap error lists accepted forms: {msg}");
+    }
+
+    #[test]
+    fn no_auto_index_flag_parses() {
+        let cli = Cli::try_parse_from(["msrch", "q", "--no-auto-index"]).expect("should parse");
+        assert!(cli.no_auto_index);
     }
 }

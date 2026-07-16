@@ -10,13 +10,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const FORMS: &str = "accepted forms: YYYY-MM-DD, or relative 7d / 2w / 3m (days/weeks/months ago)";
 
 /// clap value parser for `--after` / `--before`.
-// consumed by the CLI-flags task (Task 4)
-#[allow(dead_code)]
 pub fn parse_date_arg(s: &str) -> Result<SystemTime, String> {
     resolve_with_now(s, SystemTime::now())
 }
 
-#[allow(dead_code)]
 fn resolve_with_now(s: &str, now: SystemTime) -> Result<SystemTime, String> {
     let s = s.trim();
     if s.is_empty() {
