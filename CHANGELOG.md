@@ -5,6 +5,23 @@ or index-compatibility changes, **patch** for fixes. Every release is a git tag
 (`vX.Y.Z`); `msrch --version` prints the semver, index schema version, and the
 commit the binary was built from.
 
+## [0.5.0] - 2026-07-16
+
+### Added
+- `--min-similarity` / `-m`: per-query minimum similarity (0.0–1.0),
+  overriding config's `query.min_similarity`.
+- `LICENSE` (MIT) and the `license` manifest field.
+
+### Changed
+- **Global config now lives at `~/.config/msrch/config.toml` on every
+  platform** (`$XDG_CONFIG_HOME/msrch/config.toml` when set). On macOS an
+  existing config in the legacy confy location
+  (`~/Library/Application Support/rs.msrch/`) is copied over automatically on
+  first run — the old file is left in place. A missing config now yields
+  defaults without auto-creating a file. The `confy` dependency is gone.
+
+No index schema change — existing indexes work as-is.
+
 ## [0.4.0] - 2026-07-16
 
 ### Added

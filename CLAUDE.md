@@ -110,9 +110,9 @@ Implementation is in `search.rs::find_index_root()`.
 ## Configuration System
 
 ### Config Hierarchy (high to low precedence)
-1. CLI flags: `--limit`, `--rerank`, `--path`, `--after`/`--before`, etc.
+1. CLI flags: `--limit`, `--min-similarity`, `--rerank`, `--path`, `--after`/`--before`, etc.
 2. Project config: `.msrch/config.toml` in the index root (field-by-field overlay)
-3. Global User config: `~/.config/msrch/config.toml` (via `confy`)
+3. Global User config: `~/.config/msrch/config.toml` ($XDG_CONFIG_HOME-aware)
 4. Hardcoded defaults in `config.rs::Default` implementations
 
 ### Default Embedding Endpoint
@@ -121,7 +121,7 @@ Implementation is in `search.rs::find_index_root()`.
 - Set in `config.rs::EmbeddingConfig::default()`
 
 ### Config Loading
-- Global: `Config::load_global_config()` uses `confy` crate (OS-specific config dir)
+- Global: `~/.config/msrch/config.toml` (XDG-aware; one-time copy migration from the legacy macOS confy path; missing file → defaults, no auto-creation)
 - Project: merged via Config::load_for_index(index_root) — global config overlaid with .msrch/config.toml (project wins field-by-field; malformed project file warns and is ignored)
 - Note: retries are pending implementation; `max_file_size_mb` is enforced for extractable document types only (see extract.rs)
 

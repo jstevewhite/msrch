@@ -21,6 +21,7 @@ Filters (query only):
     msrch "quarterly numbers" --path 2026/07          # path substring
     msrch "action items" --after 7d                   # modified in the last 7 days
     msrch "planning" --after 2026-07-01 --before 2026-08-01
+    msrch "config parsing" -m 0.7                     # per-query similarity floor
 
 Notes:
 - `--format json` gives structured output (file_path, chunk_index, similarity,

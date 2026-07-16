@@ -81,10 +81,7 @@ Extraction of these document formats respects `chunking.max_file_size_mb` (defau
 
 ### 1. Configure Embedding Service
 
-Create a global config file named `config.toml` in your OS config directory:
-
-- **macOS**: `~/Library/Application Support/rs.msrch/config.toml`
-- **Linux**: `~/.config/msrch/config.toml`
+Create a global config file at `~/.config/msrch/config.toml` (or `$XDG_CONFIG_HOME/msrch/config.toml` if set):
 
 ```toml
 [embedding]
@@ -96,6 +93,8 @@ model = "mixedbread-ai/mxbai-embed-large-v1"
 default_limit = 10
 min_similarity = 0.5
 ```
+
+Upgrading: if a config exists only in the legacy macOS location (`~/Library/Application Support/rs.msrch/`), it is copied over automatically on first run (the old file is left in place).
 
 Run `msrch config` at any time to print the effective configuration.
 
@@ -182,11 +181,13 @@ msrch "recent" --after 2026-07-01          # YYYY-MM-DD form
 msrch "old" --before 2w                    # before 2 weeks ago
 msrch "planning notes" --after 3m          # last ~3 months
 msrch "window" --after 2026-07-01 --before 2026-08-01
+
+# Per-query minimum similarity (0.0-1.0; default from config)
+msrch "config parsing" --min-similarity 0.7    # or: -m 0.7
 ```
 
-The minimum-similarity threshold is set via `query.min_similarity` in config;
-there is no CLI flag for it. Index discovery is automatic (walk-up), so there is
-no `--index` flag either — run from anywhere inside the indexed tree.
+Index discovery is automatic (walk-up), so there is no `--index` flag —
+run from anywhere inside the indexed tree.
 
 ### Advanced Commands
 
@@ -202,10 +203,9 @@ msrch config
 
 Configuration is loaded in this priority order:
 
-1. CLI flags (`--limit`, `--format`, `--rerank`, `--path`, `--after`/`--before`, `--no-auto-index`)
+1. CLI flags (`--limit`, `--format`, `--min-similarity`, `--rerank`, `--path`, `--after`/`--before`, `--no-auto-index`)
 2. Project config: `.msrch/config.toml` in the index root (overlaid field-by-field)
-3. Global user config: `config.toml` in your OS config directory
-   (macOS: `~/Library/Application Support/rs.msrch/`, Linux: `~/.config/msrch/`)
+3. Global user config: `~/.config/msrch/config.toml` (`$XDG_CONFIG_HOME/msrch/config.toml` when set)
 4. Built-in defaults
 
 ### Example Configuration
