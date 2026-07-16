@@ -68,6 +68,26 @@ fn sql_like_escape(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+/// True when `mtime` satisfies the (optional) bounds: `after` is inclusive,
+/// `before` is exclusive — matching `--after`/`--before` CLI semantics.
+fn passes_date_filter(
+    mtime: SystemTime,
+    after: Option<SystemTime>,
+    before: Option<SystemTime>,
+) -> bool {
+    if let Some(a) = after
+        && mtime < a
+    {
+        return false;
+    }
+    if let Some(b) = before
+        && mtime >= b
+    {
+        return false;
+    }
+    true
+}
+
 pub struct Searcher {
     config: Config,
     index_root: PathBuf,
@@ -123,11 +143,19 @@ impl Searcher {
             .filter(|p| !p.is_empty())
             .map(|p| format!("file_path LIKE '%{}%'", sql_like_escape(p)));
 
-        // If reranker enabled, fetch more candidates for reranking
-        let fetch_limit = if reranker.is_enabled() {
-            reranker.top_n().max(limit)
+        let date_filtering = opts.after.is_some() || opts.before.is_some();
+
+        // Date filters post-filter the hit list, so over-fetch to avoid
+        // starving `limit`. Path-only filtering is exact (DB-side predicate).
+        let base_fetch = if date_filtering {
+            (limit * 10).max(100)
         } else {
             limit
+        };
+        let fetch_limit = if reranker.is_enabled() {
+            base_fetch.max(reranker.top_n())
+        } else {
+            base_fetch
         };
 
         let mut results = db
@@ -139,11 +167,30 @@ impl Searcher {
             )
             .await?;
 
-        // Apply reranking if enabled
+        // Manifest join: drop hits whose file mtime misses the date bounds.
+        if date_filtering {
+            let mtimes = crate::index::load_file_mtimes(&self.index_root)?;
+            results.retain(|r| {
+                let path = r
+                    .payload
+                    .get("file_path")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from);
+                match path.and_then(|p| mtimes.get(&p).copied()) {
+                    Some(mtime) => passes_date_filter(mtime, opts.after, opts.before),
+                    None => {
+                        debug!("date filter: no manifest mtime for a hit; excluding it");
+                        false
+                    }
+                }
+            });
+        }
+
+        // Rerank the filter survivors (never wastes cross-encoder budget on
+        // hits the date filter would discard), then truncate to limit.
         if reranker.is_enabled() && !results.is_empty() {
             debug!("Reranking {} candidates", results.len());
 
-            // Extract document contents for reranking
             let documents: Vec<String> = results
                 .iter()
                 .map(|r| {
@@ -158,8 +205,6 @@ impl Searcher {
             match reranker.rerank(query_text, documents).await {
                 Ok(reranked) => {
                     debug!("Reranking complete, got {} results", reranked.len());
-
-                    // Reorder results based on reranker scores
                     let mut reranked_results: Vec<ScoredPoint> = reranked
                         .into_iter()
                         .filter_map(|(idx, score)| {
@@ -170,8 +215,6 @@ impl Searcher {
                             })
                         })
                         .collect();
-
-                    // Take top limit
                     reranked_results.truncate(limit);
                     results = reranked_results;
                 }
@@ -182,6 +225,8 @@ impl Searcher {
                     results.truncate(limit);
                 }
             }
+        } else {
+            results.truncate(limit);
         }
 
         Ok(results.iter().map(SearchResult::from_point).collect())
@@ -323,6 +368,21 @@ mod tests {
         assert!(!opts.use_rerank);
         assert!(opts.path_contains.is_none());
         assert!(opts.after.is_none() && opts.before.is_none());
+    }
+
+    #[test]
+    fn passes_date_filter_boundaries() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let t = |s: u64| UNIX_EPOCH + Duration::from_secs(s);
+        // after is inclusive:
+        assert!(passes_date_filter(t(100), Some(t(100)), None));
+        assert!(!passes_date_filter(t(99), Some(t(100)), None));
+        // before is exclusive:
+        assert!(!passes_date_filter(t(100), None, Some(t(100))));
+        assert!(passes_date_filter(t(99), None, Some(t(100))));
+        // both bounds; and unbounded passes everything:
+        assert!(passes_date_filter(t(150), Some(t(100)), Some(t(200))));
+        assert!(passes_date_filter(t(0), None, None));
     }
 
     #[test]

@@ -137,6 +137,30 @@ pub async fn get_stats(start_path: &Path) -> Result<IndexStats> {
     })
 }
 
+/// Per-file modification times from the index manifest, for date-filtered
+/// queries. Errors when the manifest is missing or unreadable — a date filter
+/// without a manifest is unanswerable, so callers must not silently degrade.
+pub fn load_file_mtimes(index_root: &Path) -> Result<HashMap<PathBuf, SystemTime>> {
+    let manifest_path = index_root.join(".msrch").join("manifest.json");
+    let file = std::fs::File::open(&manifest_path).with_context(|| {
+        format!(
+            "date filters need the index manifest at {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: Manifest = serde_json::from_reader(file).with_context(|| {
+        format!(
+            "date filters need a readable index manifest at {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(manifest
+        .files
+        .into_iter()
+        .map(|(path, meta)| (path, meta.modified_at))
+        .collect())
+}
+
 /// Remove the index artifacts (`index.db/`, `manifest.json`) from an index
 /// root, preserving everything else in `.msrch` — notably `config.toml`.
 pub fn remove_index_artifacts(index_root: &Path) -> Result<()> {
@@ -544,6 +568,34 @@ mod tests {
             manifest.version, 0,
             "a missing version must read as 0 so migration is triggered"
         );
+    }
+
+    #[test]
+    fn load_file_mtimes_reads_manifest_and_errors_when_missing() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = tempfile::tempdir().unwrap();
+        let msrch_dir = dir.path().join(".msrch");
+        std::fs::create_dir_all(&msrch_dir).unwrap();
+        std::fs::write(
+            msrch_dir.join("manifest.json"),
+            r#"{"version":5,"files":{
+                "/repo/a.md":{"modified_at":{"secs_since_epoch":100,"nanos_since_epoch":0},"chunk_ids":[]},
+                "/repo/b.md":{"modified_at":{"secs_since_epoch":200,"nanos_since_epoch":0},"chunk_ids":[]}
+            }}"#,
+        )
+        .unwrap();
+
+        let mtimes = load_file_mtimes(dir.path()).unwrap();
+        assert_eq!(mtimes.len(), 2);
+        assert_eq!(
+            mtimes[&PathBuf::from("/repo/a.md")],
+            UNIX_EPOCH + Duration::from_secs(100)
+        );
+
+        // Missing manifest → hard error mentioning the manifest.
+        let empty = tempfile::tempdir().unwrap();
+        let err = load_file_mtimes(empty.path()).unwrap_err();
+        assert!(format!("{err:#}").contains("manifest"), "{err:#}");
     }
 
     #[test]
