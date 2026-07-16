@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const FORMS: &str = "accepted forms: YYYY-MM-DD, or relative 7d / 2w / 3m (days/weeks/months ago)";
 
-/// clap value parser for `--after` / `--before`.
+/// Date-argument parser shared by the CLI (clap value_parser) and MCP front-ends.
 pub fn parse_date_arg(s: &str) -> Result<SystemTime, String> {
     resolve_with_now(s, SystemTime::now())
 }

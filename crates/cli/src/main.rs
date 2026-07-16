@@ -1,4 +1,3 @@
-mod dates;
 mod output;
 
 use anyhow::Context;
@@ -65,11 +64,11 @@ struct Cli {
     path: Option<String>,
 
     /// Only match files modified on/after this date (YYYY-MM-DD, or 7d/2w/3m ago)
-    #[arg(long, global = true, value_parser = dates::parse_date_arg)]
+    #[arg(long, global = true, value_parser = msrch_core::dates::parse_date_arg)]
     after: Option<std::time::SystemTime>,
 
     /// Only match files modified before this date (YYYY-MM-DD, or 7d/2w/3m ago)
-    #[arg(long, global = true, value_parser = dates::parse_date_arg)]
+    #[arg(long, global = true, value_parser = msrch_core::dates::parse_date_arg)]
     before: Option<std::time::SystemTime>,
 
     /// Skip the automatic index refresh even if query.auto_index is enabled
@@ -102,10 +101,10 @@ enum Commands {
         #[arg(long)]
         path: Option<String>,
         /// Only match files modified on/after this date (YYYY-MM-DD, or 7d/2w/3m ago)
-        #[arg(long, value_parser = dates::parse_date_arg)]
+        #[arg(long, value_parser = msrch_core::dates::parse_date_arg)]
         after: Option<std::time::SystemTime>,
         /// Only match files modified before this date (YYYY-MM-DD, or 7d/2w/3m ago)
-        #[arg(long, value_parser = dates::parse_date_arg)]
+        #[arg(long, value_parser = msrch_core::dates::parse_date_arg)]
         before: Option<std::time::SystemTime>,
     },
     /// Force full rebuild

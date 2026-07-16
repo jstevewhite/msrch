@@ -1,6 +1,7 @@
 pub mod chunker;
 pub mod config;
 pub mod crawler;
+pub mod dates;
 pub mod db;
 pub mod embedding;
 pub mod extract;
