@@ -89,7 +89,7 @@ pub struct Config { pub field: String }
 
 ### Configuration
 - Use `serde` + TOML for config files
-- Load global config with `confy::load("msrch", "config")`
+- Load global config with `Config::load_global_config()` — reads `~/.config/msrch/config.toml` (XDG-aware)
 - Support per-project overrides
 
 ### Vector Database (LanceDB)
