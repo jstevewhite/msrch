@@ -113,6 +113,9 @@ pub struct QueryConfig {
     pub default_limit: usize,
     pub min_similarity: f32,
     pub output_format: String,
+    /// Run the incremental index pass before every query in this index
+    /// (quiet; non-fatal). Set per-project for fast-changing document repos.
+    pub auto_index: bool,
 }
 
 impl Default for QueryConfig {
@@ -121,6 +124,7 @@ impl Default for QueryConfig {
             default_limit: 10,
             min_similarity: 0.5,
             output_format: "context".to_string(),
+            auto_index: false,
         }
     }
 }
@@ -360,6 +364,13 @@ model = "project-model"
 
         let merged = Config::overlay_project_config(Config::default(), &config_path);
         assert_eq!(merged.query.default_limit, Config::default().query.default_limit);
+    }
+
+    #[test]
+    fn auto_index_defaults_false_and_loads_from_toml() {
+        assert!(!QueryConfig::default().auto_index);
+        let config: Config = toml::from_str("[query]\nauto_index = true\n").unwrap();
+        assert!(config.query.auto_index);
     }
 
     #[test]

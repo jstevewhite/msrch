@@ -208,17 +208,31 @@ impl Indexer {
         Ok(had_existing)
     }
 
+    /// Index (or incrementally reindex) with normal progress output.
     pub async fn index(&self) -> Result<()> {
+        self.run_index(false).await.map(|_| ())
+    }
+
+    /// Incremental index pass with no progress bars and no stdout — for
+    /// auto-index-before-query. Returns the number of files whose chunks
+    /// were (re)embedded, so the caller can print one status line iff > 0.
+    pub async fn index_quiet(&self) -> Result<usize> {
+        self.run_index(true).await
+    }
+
+    async fn run_index(&self, quiet: bool) -> Result<usize> {
         let msrch_dir = self.root_path.join(".msrch");
         fs::create_dir_all(&msrch_dir).context("Failed to create .msrch dir")?;
 
         let crawler = Crawler::new(self.config.indexing.clone()); // TODO: pass actual config
         let mut chunker = Chunker::new(self.config.chunking.clone());
         let embedder = EmbeddingClient::new(self.config.embedding.clone())?;
-        println!(
-            "Using embedding endpoint: {}",
-            self.config.embedding.endpoint
-        );
+        if !quiet {
+            println!(
+                "Using embedding endpoint: {}",
+                self.config.embedding.endpoint
+            );
+        }
 
         let manifest_path = msrch_dir.join("manifest.json");
         let db_path = msrch_dir.join("index.db");
@@ -230,7 +244,7 @@ impl Indexer {
         };
 
         // Rebuild from scratch if the on-disk schema predates the current version.
-        if Self::migrate_if_needed(&db_path, &mut manifest)? {
+        if Self::migrate_if_needed(&db_path, &mut manifest)? && !quiet {
             println!(
                 "Index schema is outdated; rebuilding from scratch (schema v{}).",
                 SCHEMA_VERSION
@@ -241,11 +255,19 @@ impl Indexer {
         let db = VectorDB::new(db_path).await?;
         // Collection will be initialized on first embedding (to detect dimension)
 
-        println!("Scanning files...");
+        if !quiet {
+            println!("Scanning files...");
+        }
         let files = crawler.crawl(&self.root_path)?;
-        println!("Found {} files.", files.len());
+        if !quiet {
+            println!("Found {} files.", files.len());
+        }
 
-        let pb = ProgressBar::new(files.len() as u64);
+        let pb = if quiet {
+            ProgressBar::hidden()
+        } else {
+            ProgressBar::new(files.len() as u64)
+        };
         pb.set_style(ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
             .unwrap()
@@ -253,6 +275,7 @@ impl Indexer {
 
         let mut chunks_to_embed = Vec::new();
         let mut new_manifest_entries = HashMap::new();
+        let mut refreshed_files: usize = 0;
 
         for file_path in files {
             pb.set_message(format!(
@@ -319,6 +342,9 @@ impl Indexer {
                 },
             );
 
+            if !file_chunks.is_empty() {
+                refreshed_files += 1;
+            }
             chunks_to_embed.extend(file_chunks);
             pb.inc(1);
         }
@@ -333,7 +359,9 @@ impl Indexer {
             .collect();
 
         if !deleted_files.is_empty() {
-            println!("Cleaning up {} deleted files...", deleted_files.len());
+            if !quiet {
+                println!("Cleaning up {} deleted files...", deleted_files.len());
+            }
             for deleted_path in &deleted_files {
                 if let Some(meta) = manifest.files.get(deleted_path) {
                     if !meta.chunk_ids.is_empty() {
@@ -358,11 +386,15 @@ impl Indexer {
             manifest.files = new_manifest_entries;
             let file = fs::File::create(&manifest_path)?;
             serde_json::to_writer_pretty(file, &manifest)?;
-            println!("No new files to index.");
-            return Ok(());
+            if !quiet {
+                println!("No new files to index.");
+            }
+            return Ok(refreshed_files);
         }
 
-        println!("Embedding {} chunks...", chunks_to_embed.len());
+        if !quiet {
+            println!("Embedding {} chunks...", chunks_to_embed.len());
+        }
 
         // Batch embedding
         let batch_size = self.config.embedding.batch_size;
@@ -463,7 +495,7 @@ impl Indexer {
         let file = fs::File::create(&manifest_path)?;
         serde_json::to_writer_pretty(file, &manifest)?;
 
-        Ok(())
+        Ok(refreshed_files)
     }
 }
 
@@ -596,6 +628,15 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let err = load_file_mtimes(empty.path()).unwrap_err();
         assert!(format!("{err:#}").contains("manifest"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn index_quiet_on_empty_dir_returns_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexer = Indexer::new(dir.path().to_path_buf(), crate::config::Config::default());
+        // No files → no embedding needed → succeeds without network, returns 0.
+        let refreshed = indexer.index_quiet().await.unwrap();
+        assert_eq!(refreshed, 0);
     }
 
     #[test]

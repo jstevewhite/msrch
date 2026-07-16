@@ -104,7 +104,7 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     // Bind no_auto_index before cli.command is moved (consumed by auto-index wiring)
-    let _no_auto_index = cli.no_auto_index;
+    let no_auto_index = cli.no_auto_index;
 
     // Handle implicit query (msrch "search text" without subcommand)
     let command = match cli.command {
@@ -151,7 +151,23 @@ async fn main() -> anyhow::Result<()> {
             after,
             before,
         } => {
-            let searcher = search::Searcher::new(None)
+            let current_dir = std::env::current_dir()?;
+            let index_root = index::find_index_root(&current_dir)
+                .context("No .msrch index found in directory tree")?;
+            let config = config::Config::load_for_index(&index_root);
+
+            if config.query.auto_index && !no_auto_index {
+                let indexer = index::Indexer::new(index_root.clone(), config.clone());
+                match indexer.index_quiet().await {
+                    Ok(0) => {}
+                    Ok(n) => println!("auto-index: refreshed {n} file(s)"),
+                    Err(e) => eprintln!(
+                        "warning: auto-index failed ({e}); searching the existing index"
+                    ),
+                }
+            }
+
+            let searcher = search::Searcher::new(Some(index_root))
                 .await
                 .context("Initialization failed")?;
             let opts = search::SearchOptions {
