@@ -5,6 +5,22 @@ or index-compatibility changes, **patch** for fixes. Every release is a git tag
 (`vX.Y.Z`); `msrch --version` prints the semver, index schema version, and the
 commit the binary was built from.
 
+## [0.4.0] - 2026-07-16
+
+### Added
+- **Query filters**: `--path <substring>` (matches anywhere in the file path;
+  SQL LIKE wildcards pass through), `--after` / `--before` (file modification
+  time; `YYYY-MM-DD` or relative `7d`/`2w`/`3m`; after-inclusive,
+  before-exclusive). Filters compose with `--rerank` — reranking now runs on
+  the filtered candidates.
+- **Auto-index**: set `query.auto_index = true` in a repo's
+  `.msrch/config.toml` and every query refreshes the index first — quietly
+  (one status line only when files changed) and non-fatally (endpoint down →
+  warning + stale results, never a failed query). `--no-auto-index` skips it.
+- `docs/AGENTS-SNIPPET.md`: copy-paste msrch usage block for agent-driven repos.
+
+No index schema change — existing indexes work as-is.
+
 ## [0.3.0] - 2026-07-15
 
 ### Added

@@ -146,6 +146,15 @@ msrch "database" --format json | jq '.results[].file_path'
 # Use reranker for better precision (slower)
 msrch "auth logic" --rerank
 
+# Filter by path substring
+msrch "config" --path src/
+
+# Filter by file modification time (inclusive after, exclusive before)
+msrch "changes" --after 7d                  # last 7 days
+msrch "recent" --after 2026-07-01          # YYYY-MM-DD format
+msrch "old" --before 2w                    # before 2 weeks ago
+msrch "window" --after 2026-07-01 --before 2026-08-01
+
 # Specify index explicitly
 msrch "query" --index /path/to/.msrch
 ```
@@ -199,6 +208,7 @@ ignore_patterns = [
 default_limit = 10
 min_similarity = 0.5
 output_format = "context"  # plain|context|json
+auto_index = false         # refresh the index before every query
 
 [reranker]
 enabled = false
@@ -240,6 +250,13 @@ secrets.toml
 .env
 *.key
 ```
+
+## Using msrch from coding agents
+
+msrch is designed to be driven by shell-capable agents (no MCP required):
+semantic hop with `msrch`, identifier hop with `grep`. See
+[docs/AGENTS-SNIPPET.md](docs/AGENTS-SNIPPET.md) for a copy-paste block to add
+to a repo's AGENTS.md / CLAUDE.md.
 
 ## Project Structure
 

@@ -41,6 +41,7 @@ cargo run -- index .
 cargo run -- index . --debug
 cargo run -- "search query"
 cargo run -- query "search query" --limit 5 --rerank
+cargo run -- query "search query" --path docs/ --after 7d
 ```
 
 ## Architecture Overview
@@ -67,7 +68,7 @@ cargo run -- query "search query" --limit 5 --rerank
 - **`main.rs`** - CLI parsing with clap, command dispatch, implicit query support (`msrch "text"`)
 - **`config.rs`** - Global configuration via `confy` (global + project-level overrides)
 - **`index.rs`** - Indexing orchestration, incremental updates, manifest management
-- **`search.rs`** - Query execution, index discovery (walk-up pattern), output formatting
+- **`search.rs`** - Query execution, index discovery (walk-up pattern), output formatting; `SearchOptions` request struct (path/date filters)
 - **`db.rs`** - LanceDB wrapper using Arrow RecordBatch for bulk operations
 - **`embedding.rs`** - HTTP client for OpenAI-compatible embedding endpoints
 - **`reranker.rs`** - HTTP client for reranking endpoints
@@ -109,7 +110,7 @@ Implementation is in `search.rs::find_index_root()`.
 ## Configuration System
 
 ### Config Hierarchy (high to low precedence)
-1. CLI flags: `--limit`, `--rerank`, etc.
+1. CLI flags: `--limit`, `--rerank`, `--path`, `--after`/`--before`, etc.
 2. Project config: `.msrch/config.toml` in the index root (field-by-field overlay)
 3. Global User config: `~/.config/msrch/config.toml` (via `confy`)
 4. Hardcoded defaults in `config.rs::Default` implementations
