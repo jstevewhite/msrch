@@ -162,8 +162,6 @@ msrch "error handling" --limit 5
 # JSON output for scripting
 msrch "database" --format json | jq -r '.results[].file_path'
 
-JSON output includes score_kind ("vector" cosine similarity, or "reranker" cross-encoder relevance — a different scale) and a warnings array when a degradation occurred (e.g. reranker unreachable).
-
 # Deduplicated file paths only (grep -l style), for piping into other tools
 msrch "database" --format filename
 
@@ -190,6 +188,10 @@ msrch "window" --after 2026-07-01 --before 2026-08-01
 # Per-query minimum similarity (0.0-1.0; default from config)
 msrch "config parsing" --min-similarity 0.7    # or: -m 0.7
 ```
+
+JSON output includes `score_kind` (`"vector"` cosine similarity, or
+`"reranker"` cross-encoder relevance — a different scale) and a `warnings`
+array when a degradation occurred (e.g. reranker unreachable).
 
 Index discovery is automatic (walk-up), so there is no `--index` flag —
 run from anywhere inside the indexed tree.
