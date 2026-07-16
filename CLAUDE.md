@@ -66,7 +66,7 @@ cargo run -- query "search query" --path docs/ --after 7d
 ### Key Modules
 
 - **`main.rs`** - CLI parsing with clap, command dispatch, implicit query support (`msrch "text"`)
-- **`config.rs`** - Global configuration via `confy` (global + project-level overrides)
+- **`config.rs`** - Configuration types and loading: XDG-aware global config (one-time migration from the legacy confy location) + project-level overlays
 - **`index.rs`** - Indexing orchestration, incremental updates, manifest management
 - **`search.rs`** - Query execution, index discovery (walk-up pattern), output formatting; `SearchOptions` request struct (path/date filters)
 - **`db.rs`** - LanceDB wrapper using Arrow RecordBatch for bulk operations
