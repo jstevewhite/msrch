@@ -29,6 +29,16 @@ fn parse_min_similarity(s: &str) -> Result<f32, String> {
     }
 }
 
+/// --rerank / --no-rerank → the tri-state core override. clap's
+/// conflicts_with guarantees at most one is set.
+fn rerank_flag(rerank: bool, no_rerank: bool) -> Option<bool> {
+    match (rerank, no_rerank) {
+        (true, _) => Some(true),
+        (_, true) => Some(false),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 enum McpTransportArg {
     Stdio,
@@ -60,6 +70,10 @@ struct Cli {
     /// Use reranker for more precise results (slower)
     #[arg(long, global = true)]
     rerank: bool,
+
+    /// Skip reranking even if the config enables it
+    #[arg(long, global = true, conflicts_with = "rerank")]
+    no_rerank: bool,
 
     /// Minimum similarity score (0.0-1.0); overrides query.min_similarity
     #[arg(long, short = 'm', global = true, value_parser = parse_min_similarity)]
@@ -100,6 +114,9 @@ enum Commands {
         /// Use reranker for more precise results (slower)
         #[arg(long)]
         rerank: bool,
+        /// Skip reranking even if the config enables it
+        #[arg(long, conflicts_with = "rerank")]
+        no_rerank: bool,
         /// Minimum similarity score (0.0-1.0); overrides query.min_similarity
         #[arg(long, short = 'm', value_parser = parse_min_similarity)]
         min_similarity: Option<f32>,
@@ -158,6 +175,7 @@ async fn main() -> anyhow::Result<()> {
                 limit: cli.limit,
                 format: cli.format.unwrap_or_default(),
                 rerank: cli.rerank,
+                no_rerank: cli.no_rerank,
                 min_similarity: cli.min_similarity,
                 path: cli.path.clone(),
                 after: cli.after,
@@ -185,6 +203,7 @@ async fn main() -> anyhow::Result<()> {
             limit,
             format,
             rerank,
+            no_rerank,
             min_similarity,
             path,
             after,
@@ -211,7 +230,7 @@ async fn main() -> anyhow::Result<()> {
                 .context("Initialization failed")?;
             let opts = search::SearchOptions {
                 limit: *limit,
-                rerank: (*rerank).then_some(true), // Task 2 makes this tri-state
+                rerank: rerank_flag(*rerank, *no_rerank),
                 min_similarity: *min_similarity,
                 path_contains: path.clone(),
                 after: *after,
@@ -407,6 +426,29 @@ mod tests {
                 assert_eq!(bind.as_deref(), Some("0.0.0.0:7920"));
             }
             other => panic!("expected Mcp, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rerank_flags_parse_tri_state_and_conflict() {
+        // Neither → None (config decides).
+        let cli = Cli::try_parse_from(["msrch", "q"]).unwrap();
+        assert!(!cli.rerank && !cli.no_rerank);
+        assert_eq!(rerank_flag(cli.rerank, cli.no_rerank), None);
+        // --rerank → Some(true).
+        let cli = Cli::try_parse_from(["msrch", "q", "--rerank"]).unwrap();
+        assert_eq!(rerank_flag(cli.rerank, cli.no_rerank), Some(true));
+        // --no-rerank → Some(false).
+        let cli = Cli::try_parse_from(["msrch", "q", "--no-rerank"]).unwrap();
+        assert_eq!(rerank_flag(cli.rerank, cli.no_rerank), Some(false));
+        // Both → clap conflict error.
+        let err = Cli::try_parse_from(["msrch", "q", "--rerank", "--no-rerank"]).unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"), "{err}");
+        // Subcommand form parses too.
+        let cli = Cli::try_parse_from(["msrch", "query", "q", "--no-rerank"]).unwrap();
+        match cli.command {
+            Some(Commands::Query { no_rerank, .. }) => assert!(no_rerank),
+            other => panic!("expected Query, got {other:?}"),
         }
     }
 }
