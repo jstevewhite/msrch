@@ -212,7 +212,7 @@ ignore_patterns = [
 default_limit = 10
 min_similarity = 0.5
 output_format = "context"  # plain|context|json
-auto_index = true   # refresh the index before every query — quiet (one line only when files changed); failures fall back to the stale index
+auto_index = false  # (default) set true to refresh the index before every query — quiet (one line only when files changed); failures fall back to the stale index
 
 [reranker]
 enabled = false
