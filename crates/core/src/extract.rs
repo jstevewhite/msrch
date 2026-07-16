@@ -98,8 +98,25 @@ fn readability_markdown(raw: &str) -> Option<(String, String)> {
     Some((title, body))
 }
 
-fn extract_pdf(_path: &Path) -> Result<Option<String>> {
-    anyhow::bail!("extract_pdf: implemented in Task 4")
+/// Minimum trimmed text length for a PDF to count as having a text layer.
+const PDF_MIN_TEXT_CHARS: usize = 200;
+
+fn extract_pdf(path: &Path) -> Result<Option<String>> {
+    let text = match pdf_extract::extract_text(path) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("warning: skipping {}: failed to parse PDF: {e}", path.display());
+            return Ok(None);
+        }
+    };
+    if text.trim().len() < PDF_MIN_TEXT_CHARS {
+        eprintln!(
+            "warning: skipping {}: no text layer (graphics-only?)",
+            path.display()
+        );
+        return Ok(None);
+    }
+    Ok(Some(text))
 }
 fn extract_docx(path: &Path) -> Result<Option<String>> {
     let file = match fs::File::open(path) {
@@ -608,6 +625,31 @@ mod tests {
         assert!(row_line.contains("outer-b"), "outer cells on one row line: {text}");
         assert!(text.contains("inner"), "nested content not lost: {text}");
         assert!(text.contains("after table"), "post-table paragraph intact: {text}");
+    }
+
+    #[test]
+    fn pdf_text_layer_extracts_as_prose() {
+        let text = extract(&fixture("text-layer.pdf"), u64::MAX)
+            .unwrap()
+            .expect("text-layer pdf must extract");
+        assert!(text.contains("quarterly report"), "text layer content: {text}");
+        assert!(text.trim().len() >= 200, "fixture must exceed threshold: {}", text.len());
+    }
+
+    #[test]
+    fn pdf_without_text_layer_is_skipped() {
+        assert!(
+            extract(&fixture("graphics-only.pdf"), u64::MAX).unwrap().is_none(),
+            "graphics-only pdf → skip"
+        );
+    }
+
+    #[test]
+    fn pdf_that_is_corrupt_is_skipped_not_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("corrupt.pdf");
+        std::fs::write(&p, b"%PDF-1.4 truncated garbage").unwrap();
+        assert!(extract(&p, u64::MAX).unwrap().is_none(), "corrupt pdf → skip, not Err");
     }
 
     #[test]
