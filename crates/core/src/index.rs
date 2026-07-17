@@ -419,6 +419,18 @@ impl Indexer {
             println!("Embedding {} chunks...", chunks_to_embed.len());
         }
 
+        // Progress over chunks (incremented per completed batch) — embedding
+        // dominates wall-clock on large corpora, so it gets its own bar.
+        let embed_pb = if quiet {
+            ProgressBar::hidden()
+        } else {
+            ProgressBar::new(chunks_to_embed.len() as u64)
+        };
+        embed_pb.set_style(ProgressStyle::default_bar()
+            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) {msg}")
+            .unwrap()
+            .progress_chars("#>-"));
+
         // Batch embedding
         let batch_size = self.config.embedding.batch_size;
         let total_batches = (chunks_to_embed.len() + batch_size - 1) / batch_size;
@@ -484,11 +496,14 @@ impl Indexer {
                     debug!("Prepared {} points for upsert", points.len());
 
                     match db.upsert_chunks(points).await {
-                        Ok(_) => debug!(
-                            "Batch {}/{} upserted successfully",
-                            batch_num + 1,
-                            total_batches
-                        ),
+                        Ok(_) => {
+                            debug!(
+                                "Batch {}/{} upserted successfully",
+                                batch_num + 1,
+                                total_batches
+                            );
+                            embed_pb.inc(batch.len() as u64);
+                        }
                         Err(e) => {
                             error!(
                                 "Failed to upsert batch {}/{}: {:?}",
@@ -496,6 +511,8 @@ impl Indexer {
                                 total_batches,
                                 e
                             );
+                            // Clear the bar so the error isn't painted over it.
+                            embed_pb.finish_and_clear();
                             return Err(e.context(format!("Batch {} upsert failed", batch_num + 1)));
                         }
                     }
@@ -507,11 +524,13 @@ impl Indexer {
                         total_batches,
                         e
                     );
+                    embed_pb.finish_and_clear();
                     eprintln!("Failed to embed batch {}: {}", batch_num + 1, e);
                     return Err(e);
                 }
             }
         }
+        embed_pb.finish_with_message("Done embedding.");
         info!("All {} batches processed successfully", total_batches);
 
         manifest.files = new_manifest_entries;

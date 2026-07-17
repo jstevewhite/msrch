@@ -5,6 +5,15 @@ or index-compatibility changes, **patch** for fixes. Every release is a git tag
 (`vX.Y.Z`); `msrch --version` prints the semver, index schema version, and the
 commit the binary was built from.
 
+## [0.7.2] - 2026-07-16
+
+### Fixed
+- Embedding progress bar: `msrch index`/`reindex` previously went silent
+  after "Embedding N chunks..." for the entire embedding phase — the
+  longest part of indexing a large corpus. A chunk-granular bar (same style
+  as the file-processing bar) now tracks batch completion; hidden in quiet
+  auto-index mode, cleared before any error output.
+
 ## [0.7.1] - 2026-07-16
 
 ### Fixed
