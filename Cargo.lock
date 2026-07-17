@@ -4397,7 +4397,7 @@ dependencies = [
 
 [[package]]
 name = "msrch"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4414,7 +4414,7 @@ dependencies = [
 
 [[package]]
 name = "msrch-core"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "arrow",
@@ -4448,7 +4448,7 @@ dependencies = [
 
 [[package]]
 name = "msrch-mcp"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "axum",

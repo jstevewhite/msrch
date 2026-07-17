@@ -5,6 +5,17 @@ or index-compatibility changes, **patch** for fixes. Every release is a git tag
 (`vX.Y.Z`); `msrch --version` prints the semver, index schema version, and the
 commit the binary was built from.
 
+## [0.7.1] - 2026-07-16
+
+### Fixed
+- `msrch index <path>` panicked at argument parsing (clap TypeId downcast)
+  since 0.4.0: the global `--path` filter (string) and the index subcommand's
+  positional path (PathBuf) shared a clap arg ID with different types. The
+  positional is internally renamed — the CLI surface is unchanged — and a
+  parse-matrix regression test now covers every subcommand against the
+  global flags. `reindex` and auto-index were unaffected, which is how this
+  hid for three releases.
+
 ## [0.7.0] - 2026-07-16
 
 ### Added

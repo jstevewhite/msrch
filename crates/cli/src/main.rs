@@ -7,7 +7,7 @@ use output::OutputFormat;
 use std::path::PathBuf;
 
 /// Version line for `msrch --version`: semver, index schema, and build commit.
-/// e.g. `msrch 0.7.0 (index schema v5, commit a1b2c3d)`
+/// e.g. `msrch 0.7.1 (index schema v5, commit a1b2c3d)`
 fn version_string() -> String {
     format!(
         "{} (index schema v{}, commit {})",
@@ -100,7 +100,10 @@ struct Cli {
 enum Commands {
     /// Create/update index in <path>
     Index {
-        path: PathBuf,
+        // Named `target` (not `path`) so its clap ID can't collide with the
+        // global --path filter — same-ID-different-type panics at parse time.
+        #[arg(value_name = "PATH")]
+        target: PathBuf,
         #[arg(long)]
         debug: bool,
     },
@@ -185,14 +188,14 @@ async fn main() -> anyhow::Result<()> {
     };
 
     match &command {
-        Commands::Index { path, debug } => {
+        Commands::Index { target, debug } => {
             if *debug {
                 env_logger::Builder::from_default_env()
                     .filter_level(log::LevelFilter::Debug)
                     .init();
             }
             // Resolve absolute path
-            let root_path = std::fs::canonicalize(path).unwrap_or(path.clone());
+            let root_path = std::fs::canonicalize(target).unwrap_or(target.clone());
             let config = config::Config::load_for_index(&root_path);
             let indexer = index::Indexer::new(root_path, config);
             indexer.index().await.context("Indexing failed")?;
@@ -449,6 +452,27 @@ mod tests {
         match cli.command {
             Some(Commands::Query { no_rerank, .. }) => assert!(no_rerank),
             other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_subcommand_parses_with_globals_defined() {
+        // Regression: the global --path filter (String) collided with Index's
+        // positional `path` field (PathBuf) — same clap arg ID, different
+        // types — panicking at parse time with a TypeId downcast error.
+        // Parse every subcommand so any future global/subcommand ID collision
+        // fails here instead of in the field.
+        for args in [
+            vec!["msrch", "index", "."],
+            vec!["msrch", "reindex"],
+            vec!["msrch", "stats"],
+            vec!["msrch", "similar", "some-file.rs"],
+            vec!["msrch", "config"],
+            vec!["msrch", "mcp"],
+            vec!["msrch", "query", "text"],
+        ] {
+            let parsed = Cli::try_parse_from(&args);
+            assert!(parsed.is_ok(), "failed to parse {args:?}: {:?}", parsed.err());
         }
     }
 }
